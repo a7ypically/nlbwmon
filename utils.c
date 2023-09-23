@@ -72,14 +72,18 @@ format_macaddr(struct ether_addr *mac)
 }
 
 char *
-format_ipaddr(int family, void *addr)
+format_ipaddr(int family, void *addr, int is_host_order)
 {
-	struct in_addr in;
 	static char buf[INET6_ADDRSTRLEN];
 
 	if (family == AF_INET) {
-		in.s_addr = be32toh(((struct in_addr *)addr)->s_addr);
-		inet_ntop(family, &in, buf, sizeof(buf));
+		if (is_host_order) {
+			struct in_addr in;
+			in.s_addr = htobe32(((struct in_addr *)addr)->s_addr);
+			inet_ntop(family, &in, buf, sizeof(buf));
+		} else {
+			inet_ntop(family, addr, buf, sizeof(buf));
+		}
 	}
 	else {
 		inet_ntop(family, addr, buf, sizeof(buf));

@@ -1,7 +1,6 @@
 /*
   ISC License
 
-  Copyright (c) 2016-2017, Jo-Philipp Wich <jo@mein.io>
 
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
@@ -16,31 +15,25 @@
   PERFORMANCE OF THIS SOFTWARE.
 */
 
-#ifndef __NEIGH_H__
-#define __NEIGH_H__
+#ifndef __HTTPS_H__
+#define __HTTPS_H__
 
-#include <netinet/in.h>
-#include <net/ethernet.h>
+struct ustream;
 
-union neigh_key {
-	uint32_t u32[5];
-	struct {
-		uint8_t family;
-		union {
-			struct in_addr in;
-			struct in6_addr in6;
-		} addr;
-	} data;
+typedef int (*https_client_on_data_cb)(struct ustream *s, int eof);
+typedef void (*https_client_on_error_cb)(void);
+struct https_cbs {
+	https_client_on_data_cb data;
+	https_client_on_error_cb error;
 };
 
-struct neigh_entry {
-	union neigh_key key;
-	struct ether_addr mac;
-	struct avl_node node;
-};
+struct https_ctx;
 
-int update_macaddr(int family, const void *addr);
-int lookup_macaddr(int family, const void *addr, struct ether_addr *mac);
-void neigh_ubus_update(int ack, const char *ip, const char *mac);
+void *https_init(struct https_cbs *cbs, const char *host, uint32_t port);
+void https_set_require_validation(struct https_ctx *ctx, int require);
+void https_set_retries(struct https_ctx *ctx, int retries, int delay);
+void https_send_msg(struct https_ctx *ctx, const char *url, const char *data, const char *data_content_type);
+void https_close(struct https_ctx *ctx);
+char* urlencode(const char* data);
 
 #endif

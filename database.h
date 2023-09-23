@@ -34,6 +34,9 @@
 #define db_size(db, n) \
 	(sizeof(*(db)) + (n) * sizeof(struct record))
 
+#define db_keysize \
+	offsetof(struct record, count)
+
 #define db_recsize \
 	offsetof(struct record, node)
 
@@ -52,6 +55,12 @@
 #define db_record(db, n) \
 	(struct record *)&(db)->records[(n)];
 
+#define RECORD_TYPE_WAN 0x1
+#define RECORD_TYPE_WAN_IN 0x2
+#define RECORD_FLAG_NOTIF_COUNTRY 0x1
+#define RECORD_FLAG_NOTIF_UPLOAD 0x2
+
+#define RECORD_NUM_HOSTS 4
 
 struct record {
 	uint8_t family;
@@ -64,8 +73,16 @@ struct record {
 	union {
 		struct in6_addr in6;
 		struct in_addr in;
+		uint8_t wan_idx;
 	} src_addr;
+	uint8_t type;
+	char country[2];
+	int32_t lonlat[2];
+	uint16_t asn;
 	uint64_t count;
+	uint16_t hosts[RECORD_NUM_HOSTS];
+	struct in6_addr last_ext_addr;
+	uint8_t flags;
 	uint64_t out_pkts;
 	uint64_t out_bytes;
 	uint64_t in_pkts;
@@ -97,8 +114,8 @@ struct dbhandle * database_mem(avl_tree_comp key_fn, void *key_ptr);
 struct dbhandle * database_init(const struct interval *intv, bool prealloc,
                                 uint32_t limit);
 
-int database_insert(struct dbhandle *h, struct record *rec);
-int database_update(struct dbhandle *h, struct record *rec);
+int database_insert(struct dbhandle *h, struct record *rec, struct record **db_rec);;
+int database_update(struct dbhandle *h, struct record *rec, struct record **db_rec);
 
 void database_reorder(struct dbhandle *h, avl_tree_comp sort_fn,
                       void *sort_ptr);
@@ -114,5 +131,14 @@ int database_archive(struct dbhandle *h);
 int database_cleanup(void);
 
 void database_free(struct dbhandle *h);
+void print_record(struct record *r);
+
+int database_get_idx(struct record *r, uint32_t *md5);
+struct record *database_get_by_idx(int idx, uint32_t *md5);
+
+typedef int (*db_archive_cb_fn)(const char *path, uint32_t timestamp);
+void database_add_archive_cb(db_archive_cb_fn fn);
+
+struct record *database_find(const void *key, uint32_t size);
 
 #endif /* __DATABASE_H__ */

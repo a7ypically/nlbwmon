@@ -1,7 +1,6 @@
+
 /*
   ISC License
-
-  Copyright (c) 2016-2017, Jo-Philipp Wich <jo@mein.io>
 
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
@@ -16,46 +15,33 @@
   PERFORMANCE OF THIS SOFTWARE.
 */
 
-#ifndef __NLBWMON_H__
-#define __NLBWMON_H__
-
-#include <stdbool.h>
-#include <stdint.h>
-#include <time.h>
+#ifndef __NOTIFY_H__
+#define __NOTIFY_H__
 
 #include <netinet/in.h>
 #include <netinet/ether.h>
+#include "database.h"
 
-#include <libubox/avl.h>
-#include <libubox/uloop.h>
+#define NOTIFY_ACTION_MUTE 1
 
-#include "timing.h"
-
-typedef int (*db_persistence_cb_fn)(const char *path, uint32_t timestamp);
-
-struct options {
-	time_t commit_interval;
-	time_t refresh_interval;
-	struct interval archive_interval;
-
-	int netlink_buffer_size;
-
-	const char *protocol_db;
-	const char *tempdir;
-	const char *socket;
-
-	struct {
-		bool compress;
-		bool prealloc;
-		uint32_t limit;
-		uint32_t generations;
-		const char *directory;
-	} db;
+struct notify_params {
+	uint8_t proto;
+	uint16_t dst_port;
+	uint8_t type;
+	union {
+		struct ether_addr ea;
+		uint64_t u64;
+		uint8_t wan_idx;
+	} src;
+	char country[2];
+	uint16_t asn;
 };
 
-extern struct options opt;
+int init_notify(const char *db_path);
+void notify_new(struct record *r);
+void notify_update(struct record *r);
+void notify_new_client(struct ether_addr *mac);
+int notify_mute_add(struct notify_params *params);
+int notify_is_muted(struct record *r, struct notify_params *params);
 
-void nlbwmon_add_presistence_cb(db_persistence_cb_fn fn);
-int nlbwmon_save_persistent(uint32_t timestamp);
-
-#endif /* __NLBWMON_H__ */
+#endif

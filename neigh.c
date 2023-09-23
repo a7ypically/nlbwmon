@@ -30,7 +30,12 @@
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <linux/rtnetlink.h>
+#include <arpa/inet.h>
+#include <netinet/ether.h>
 
+#include "utils.h"
+#include "hosts.h"
+#include "notify.h"
 #include "neigh.h"
 
 static struct avl_tree neighbors;
@@ -92,6 +97,7 @@ struct neigh_query {
 	struct ether_addr *mac;
 };
 
+static uint32_t neigh_parse_cnt;
 static int
 neigh_parse(struct nl_msg *msg, void *arg)
 {
@@ -102,6 +108,8 @@ neigh_parse(struct nl_msg *msg, void *arg)
 	struct neigh_query *query = arg;
 	struct ether_addr empty = { };
 	static struct ether_addr res;
+
+	neigh_parse_cnt++;
 
 	if (hdr->nlmsg_type != RTM_NEWNEIGH || nd->ndm_family != query->family)
 		return NL_SKIP;
@@ -137,6 +145,13 @@ ipaddr_to_macaddr(int family, const void *addr)
 	struct neigh_query query = { .family = family, .addr = addr };
 	struct ndmsg ndm = { .ndm_family = family };
 	struct nl_msg *msg = NULL;
+	struct in_addr in;
+
+	if (family == AF_INET) {
+		in = *(struct in_addr *)addr;
+		in.s_addr = htobe32(in.s_addr);
+		query.addr = &in;
+	}
 
 	msg = nlmsg_alloc_simple(RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP);
 
@@ -151,8 +166,10 @@ ipaddr_to_macaddr(int family, const void *addr)
 	nl_send_auto_complete(rt_sock, msg);
 	nlmsg_free(msg);
 
+	debug_printf("ipaddr_to_macaddr - dump %s\n", format_ipaddr(family, (void *)addr, 1));
 	while (!rt_done)
 		nl_recvmsgs(rt_sock, rt_cb);
+	debug_printf("parsed - %d\n", neigh_parse_cnt);
 
 	return query.mac;
 }
@@ -164,6 +181,7 @@ struct ifindex_query {
 	int ifindex;
 };
 
+static uint32_t ipaddr_parse_cnt;
 static int
 ipaddr_parse(struct nl_msg *msg, void *arg)
 {
@@ -174,6 +192,7 @@ ipaddr_parse(struct nl_msg *msg, void *arg)
 	int len = hdr->nlmsg_len;
 
 	for (; nlmsg_ok(hdr, len); hdr = nlmsg_next(hdr, &len)) {
+		ipaddr_parse_cnt++;
 		if (hdr->nlmsg_type != RTM_NEWADDR)
 			continue;
 
@@ -203,6 +222,14 @@ ipaddr_to_ifindex(int family, const void *addr)
 	struct ifaddrmsg ifa = { .ifa_family = family };
 	struct nl_msg *msg = NULL;
 
+	struct in_addr in;
+
+	if (family == AF_INET) {
+		in = *(struct in_addr *)addr;
+		in.s_addr = htobe32(in.s_addr);
+		query.addr = &in;
+	}
+
 	msg = nlmsg_alloc_simple(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP);
 
 	if (!msg)
@@ -216,8 +243,12 @@ ipaddr_to_ifindex(int family, const void *addr)
 	nl_send_auto_complete(rt_sock, msg);
 	nlmsg_free(msg);
 
+	debug_printf("ipaddr_to_ifindex - dump %s\n", format_ipaddr(family, (void *)addr, 1));
+
 	while (!rt_done)
 		nl_recvmsgs(rt_sock, rt_cb);
+
+	debug_printf("parsed - %d\n", ipaddr_parse_cnt);
 
 	return query.ifindex;
 }
@@ -294,13 +325,16 @@ update_macaddr(int family, const void *addr)
 	struct ether_addr *res;
 	int ifindex;
 
+	debug_printf("update_macaddr - %s\n", format_ipaddr(family, (void *)addr, 1));
+
 	if (family == AF_INET6) {
 		key.data.family = AF_INET6;
 		key.data.addr.in6 = *(struct in6_addr *)addr;
 	}
 	else {
 		key.data.family = AF_INET;
-		key.data.addr.in.s_addr = be32toh(((struct in_addr *)addr)->s_addr);
+		key.data.addr.in = *(struct in_addr *)addr;
+		//key.data.addr.in.s_addr = htobe32(((struct in_addr *)addr)->s_addr);
 	}
 
 	res = ipaddr_to_macaddr(family, &key.data.addr);
@@ -329,7 +363,10 @@ update_macaddr(int family, const void *addr)
 		avl_insert(&neighbors, &ptr->node);
 	}
 
-	ptr->mac = *res;
+	if (memcmp(&ptr->mac, res, sizeof(*res))) {
+		ptr->mac = *res;
+		if (hosts_is_new(res)) notify_new_client(res);
+	}
 	return 0;
 }
 
@@ -345,31 +382,98 @@ lookup_macaddr(int family, const void *addr, struct ether_addr *mac)
 	}
 	else {
 		key.data.family = AF_INET;
-		key.data.addr.in.s_addr = be32toh(((struct in_addr *)addr)->s_addr);
+		key.data.addr.in = *(struct in_addr *)addr;
+		//key.data.addr.in.s_addr = be32toh(((struct in_addr *)addr)->s_addr);
 	}
 
 	ptr = avl_find_element(&neighbors, &key, tmp, node);
 
-	if (!ptr)
+	if (!ptr) {
+		ptr = calloc(1, sizeof(*ptr));
+
+		if (!ptr)
+			return -ENOMEM;
+
+		ptr->key = key;
+		ptr->node.key = &ptr->key;
+
+		avl_insert(&neighbors, &ptr->node);
+
 		return -ENOENT;
+	}
 
 	*mac = ptr->mac;
 	return 0;
 }
 
 
+void neigh_ubus_update(int ack, const char *ip, const char *mac)
+{
+	struct neigh_entry *ptr, *tmp;
+	union neigh_key key = { };
+
+	if (inet_pton(AF_INET6, ip, &key.data.addr.in6)) {
+		key.data.family = AF_INET6;
+
+	}
+	else if (inet_pton(AF_INET, ip, &key.data.addr.in)) {
+		key.data.family = AF_INET;
+		key.data.addr.in.s_addr = be32toh(key.data.addr.in.s_addr);
+	} else {
+		error_printf("Error Wrong IP format: %s\n", ip);
+		return;
+	}
+
+	struct ether_addr mac_addr;
+
+	if (!ether_aton_r(mac, &mac_addr)) {
+		error_printf("Error Wrong MAC addr format: %s\n", mac);
+		return;
+	}
+
+	ptr = avl_find_element(&neighbors, &key, tmp, node);
+
+	if (!ptr) {
+		if (!ack) {
+			error_printf("Error - Can not release dhcp (%s) - does not exist\n", ip);
+			return;
+		}
+
+		//FIXME scan DB entries for this IP and update the mac addr. This can require merging.
+		debug_printf("Creating new arp entry for %s\n", ip);
+
+		ptr = calloc(1, sizeof(*ptr));
+
+		ptr->key = key;
+		ptr->node.key = &ptr->key;
+
+		avl_insert(&neighbors, &ptr->node);
+	}
+
+	if (!ack) {
+#if 0 // Some clients ignore DHCP renew time
+		avl_delete(&neighbors, &ptr->node);
+		debug_printf("Removing arp entry for %s\n", ip);
+		free(ptr);
+#endif
+		return;
+	}
+	debug_printf("Updating arp entry for %s\n", ip);
+
+	if (memcmp(&ptr->mac, &mac_addr, sizeof(mac_addr))) {
+		ptr->mac = mac_addr;
+		if (hosts_is_new(&mac_addr)) notify_new_client(&mac_addr);
+	}
+}
+
+
 static int
 avl_cmp_neigh(const void *k1, const void *k2, void *ptr)
 {
-	int i;
 	const union neigh_key *a = k1;
 	const union neigh_key *b = k2;
 
-	for (i = 0; i < sizeof(a->u32) / sizeof(a->u32[0]); i++)
-		if (a->u32[i] != b->u32[i])
-			return (a->u32[i] - b->u32[i]);
-
-	return 0;
+	return memcmp(a->u32, b->u32, sizeof(a->u32));
 }
 
 __attribute__((constructor)) static void init_neighbors(void)

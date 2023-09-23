@@ -23,7 +23,10 @@
 #include <libubox/utils.h>
 
 #include "protocol.h"
+#include "config.h"
 #include "nlbwmon.h"
+
+static int ProtocolAll = 0;
 
 static int
 avl_cmp_proto(const void *k1, const void *k2, void *ptr)
@@ -42,6 +45,8 @@ init_protocols(const char *database)
 	uint16_t port;
 	uint8_t proto;
 	FILE *in;
+
+	ProtocolAll = config_get_uint32("all_protocols", 1) != 0;
 
 	in = fopen(opt.protocol_db, "r");
 
@@ -76,9 +81,10 @@ init_protocols(const char *database)
 	return 0;
 }
 
-struct protocol *
+static struct protocol *
 lookup_protocol(uint8_t proto, uint16_t port)
 {
+	static 
 	struct protocol *pr, key = { };
 
 	key.proto = proto;
@@ -86,3 +92,33 @@ lookup_protocol(uint8_t proto, uint16_t port)
 
 	return avl_find_element(&protocols, &key, pr, node);
 }
+
+int protocol_include(uint8_t proto, uint16_t port)
+{
+	if (ProtocolAll) return 1;
+
+	return lookup_protocol(proto, port) != NULL;
+}
+
+char *get_protocol_name(uint8_t proto, uint16_t port)
+{
+	static char str[64];
+	struct protocol *p = lookup_protocol(proto, port);
+
+	if (p) return p->name;
+
+	if (!ProtocolAll) return "other";
+
+	if (port) {
+		p = lookup_protocol(proto, 0);
+		if (p) {
+			snprintf(str, sizeof(str), "%s port:%d", p->name, port);
+			return str;
+		}
+	}
+
+	snprintf(str, sizeof(str), "proto:%d port:%d", proto, port);
+	return str;
+}
+
+

@@ -22,9 +22,21 @@
 #include <netinet/in.h>
 #include <netinet/ether.h>
 
+#ifdef DEBUG_LOG
+#define debug_printf(fmt, ...) do { \
+	fprintf(stderr, fmt, ##__VA_ARGS__); \
+} while (0)
+#else
+#define debug_printf(fmt, ...)
+#endif
+
+#define error_printf(fmt, ...) do { \
+    fprintf(stderr, fmt, ##__VA_ARGS__); \
+} while (0)
+
 int rmkdir(const char *path);
 
 char * format_macaddr(struct ether_addr *mac);
-char * format_ipaddr(int family, void *addr);
+char * format_ipaddr(int family, void *addr, int is_host_order);
 
 #endif /* __UTILS_H__ */

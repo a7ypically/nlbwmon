@@ -1,7 +1,6 @@
 /*
   ISC License
 
-  Copyright (c) 2016-2017, Jo-Philipp Wich <jo@mein.io>
 
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
@@ -16,31 +15,18 @@
   PERFORMANCE OF THIS SOFTWARE.
 */
 
-#ifndef __NEIGH_H__
-#define __NEIGH_H__
+#ifndef __ASN_H__
+#define __ASN_H__
 
-#include <netinet/in.h>
-#include <net/ethernet.h>
-
-union neigh_key {
-	uint32_t u32[5];
-	struct {
-		uint8_t family;
-		union {
-			struct in_addr in;
-			struct in6_addr in6;
-		} addr;
-	} data;
-};
-
-struct neigh_entry {
-	union neigh_key key;
-	struct ether_addr mac;
+#define MAX_ORG_LEN 63
+struct asn_entry {
+	uint32_t asn;
+	char org[MAX_ORG_LEN+1];
 	struct avl_node node;
 };
 
-int update_macaddr(int family, const void *addr);
-int lookup_macaddr(int family, const void *addr, struct ether_addr *mac);
-void neigh_ubus_update(int ack, const char *ip, const char *mac);
+int asn_add(uint32_t asn, const char *org);
+const char *lookup_asn(uint32_t asn);
+int init_asn_mmap(const char *db_path, uint32_t timestamp);
 
 #endif

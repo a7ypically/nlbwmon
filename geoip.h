@@ -1,8 +1,6 @@
 /*
   ISC License
 
-  Copyright (c) 2016-2017, Jo-Philipp Wich <jo@mein.io>
-
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
   copyright notice and this permission notice appear in all copies.
@@ -16,13 +14,12 @@
   PERFORMANCE OF THIS SOFTWARE.
 */
 
-#ifndef __NEIGH_H__
-#define __NEIGH_H__
+#ifndef __GEOIP_H__
+#define __GEOIP_H__
 
 #include <netinet/in.h>
-#include <net/ethernet.h>
 
-union neigh_key {
+union geoip_key {
 	uint32_t u32[5];
 	struct {
 		uint8_t family;
@@ -33,14 +30,15 @@ union neigh_key {
 	} data;
 };
 
-struct neigh_entry {
-	union neigh_key key;
-	struct ether_addr mac;
+struct geoip_entry {
+	union geoip_key key;
+	char country[2];
+	int32_t lonlat[2];
+	uint16_t asn;
 	struct avl_node node;
 };
 
-int update_macaddr(int family, const void *addr);
-int lookup_macaddr(int family, const void *addr, struct ether_addr *mac);
-void neigh_ubus_update(int ack, const char *ip, const char *mac);
+int geoip_lookup(struct record *rec);
+int init_geoip_mmap(const char *db_path);
 
 #endif

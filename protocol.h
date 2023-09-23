@@ -35,6 +35,7 @@ struct protocol {
 };
 
 int init_protocols(const char *database);
-struct protocol * lookup_protocol(uint8_t proto, uint16_t port);
+int protocol_include(uint8_t proto, uint16_t port);
+char *get_protocol_name(uint8_t proto, uint16_t port);
 
 #endif /* __PROTOCOL_H__ */

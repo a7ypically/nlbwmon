@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <assert.h>
 
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
@@ -31,12 +32,21 @@
 #include "database.h"
 #include "protocol.h"
 #include "subnets.h"
+#include "wans.h"
+#include "utils.h"
 #include "neigh.h"
+#include "geoip.h"
+#include "asn.h"
+#include "dns.h"
+#include "hosts.h"
+#include "notify.h"
+#include "tg.h"
 
 
 static uint32_t n_pending_inserts = 0;
 static struct nl_sock *nl = NULL;
 static struct uloop_fd ufd = { };
+static int nfnetlink_dump_in_progress;
 
 static struct nla_policy ct_tuple_policy[CTA_TUPLE_MAX+1] = {
 	[CTA_TUPLE_IP]          = { .type = NLA_NESTED },
@@ -73,15 +83,74 @@ static struct nla_policy ct_counters_policy[CTA_COUNTERS_MAX+1] = {
 struct delayed_record {
 	struct uloop_timeout timeout;
 	struct record record;
+	uint32_t delay_retry;
 };
+
+static void update_dns(struct record *db_r)
+{
+	uint32_t dns_host_id = dns_inc_count_for_addr(db_r->family, &db_r->last_ext_addr);
+	if (!dns_host_id) return;
+	//If all slots are full skip
+	if (db_r->hosts[RECORD_NUM_HOSTS-1]) return;
+	for (int i=0; i<RECORD_NUM_HOSTS; ++i) {
+		if (!db_r->hosts[i]) {
+			db_r->hosts[i] = dns_host_id;
+			debug_printf("update_dns - added dns id:%d in slot:%d\n", dns_host_id, i);
+			return;
+		}
+		if (db_r->hosts[i] == dns_host_id) return;
+	}
+}
 
 static void
 database_insert_immediately(struct record *r)
 {
-	if (r->count != 0)
-		database_insert(gdbh, r);
-	else
-		database_update(gdbh, r);
+	int ret;
+	struct record *db_r;
+	if (r->count != 0) {
+		debug_printf("Database insert new connection - %s:\n", format_ipaddr(r->family, &r->last_ext_addr, 1));
+#ifdef DEBUG_LOG
+		print_record(r);
+#endif
+
+		ret = database_insert(gdbh, r, &db_r);
+		if (ret < 0) {
+			tg_send_msg("Error in database_insert!");
+		} else {
+			update_dns(db_r);
+			if (ret == 1) {
+				notify_new(db_r);
+			}
+			notify_update(db_r);
+		}
+	} else {
+		if (database_update(gdbh, r, &db_r) == 0) {
+			notify_update(db_r);
+		} else {
+			//FIXME Why do we reach this case?
+			// Dump dumping new records that have not yet been seen
+			// Mac address updates creates a new record from an existing one
+			// Other cases?
+			if (!nfnetlink_dump_in_progress) {
+				error_printf("Error in database_update - %s:\n", format_ipaddr(r->family, &r->last_ext_addr, 1));
+#ifdef DEBUG_LOG
+				print_record(r);
+#endif
+			}
+			ret = database_insert(gdbh, r, &db_r);
+			debug_printf("Adding to database: %d\n", ret);
+			if (ret < 0) {
+				tg_send_msg("Error in database_insert!");
+			} else {
+				assert(ret != 0);
+
+				if (ret == 1) {
+					update_dns(db_r);
+					notify_new(db_r);
+				}
+			}
+		}
+	}
 }
 
 static void
@@ -91,13 +160,52 @@ database_insert_delayed_cb(struct uloop_timeout *t)
 	struct delayed_record *dr;
 
 	dr = container_of(t, struct delayed_record, timeout);
-	err = update_macaddr(dr->record.family, &dr->record.src_addr.in6);
+	if (!(dr->record.type & RECORD_TYPE_WAN) && !dr->record.src_mac.u64) {
+		err = lookup_macaddr(dr->record.family, &dr->record.src_addr.in6,
+				       &dr->record.src_mac.ea);
+		if (err == -ENOENT)  {
+			err = update_macaddr(dr->record.family, &dr->record.src_addr.in6);
 
-	if (err == 0)
-		lookup_macaddr(dr->record.family, &dr->record.src_addr.in6,
-		               &dr->record.src_mac.ea);
+			if (err == 0)
+				lookup_macaddr(dr->record.family, &dr->record.src_addr.in6,
+					       &dr->record.src_mac.ea);
+		}
+	}
 
-	database_insert_immediately(&dr->record);
+	if (!(dr->record.type & RECORD_TYPE_WAN) && !dr->record.src_mac.u64) {
+		debug_printf("database_insert_delayed_cb - no mac addr for %s\n", format_ipaddr(dr->record.family, &dr->record.src_addr, 1));
+	}
+
+	if (!dr->record.country[0]) {
+		err = geoip_lookup(&dr->record);
+
+		if (err == -EAGAIN) {
+			dr->delay_retry++;
+			debug_printf("database_insert_delayed_cb - geoip(%s) for ", (dr->record.type & RECORD_TYPE_WAN) ? "wan": format_ipaddr(dr->record.family, &dr->record.src_addr, 1));
+			debug_printf("%s is -EAGAIN. Delaying again (%d).\n", format_ipaddr(dr->record.family, &dr->record.last_ext_addr, 1), dr->delay_retry);
+			if (uloop_timeout_set(&dr->timeout, 500) == -EEXIST) {
+				error_printf("Error can not reset delayed record timer.\n");
+			}
+
+			return;
+		}
+
+		if (err) {
+			if (err == -EINVAL) {
+				debug_printf("database_insert_delayed_cb - invalid (bogon) geoip(%s) for ", (dr->record.type & RECORD_TYPE_WAN) ? "wan": format_ipaddr(dr->record.family, &dr->record.src_addr, 1));
+			} else {
+				debug_printf("database_insert_delayed_cb - no geoip(%s) for ", (dr->record.type & RECORD_TYPE_WAN) ? "wan": format_ipaddr(dr->record.family, &dr->record.src_addr, 1));
+			}
+			debug_printf("%s\n", format_ipaddr(dr->record.family, &dr->record.last_ext_addr, 1));
+		}
+	}
+
+	if (dr->delay_retry > 0) {
+		debug_printf("database_insert_delayed_cb - success after %d retries -  geoip(%s) for ", dr->delay_retry, (dr->record.type & RECORD_TYPE_WAN) ? "wan": format_ipaddr(dr->record.family, &dr->record.src_addr, 1));
+		debug_printf("%s\n", format_ipaddr(dr->record.family, &dr->record.last_ext_addr, 1));
+	}
+
+	if (err != -EINVAL) database_insert_immediately(&dr->record);
 	free(dr);
 
 	if (n_pending_inserts > 0)
@@ -112,7 +220,7 @@ database_insert_delayed(struct record *r)
 	/* to avoid gobbling up too much memory, tie the maximum allowed number
 	 * of pending insertions to the configured database limit */
 	if (opt.db.limit > 0 && n_pending_inserts >= opt.db.limit) {
-		fprintf(stderr, "Too many pending MAC address lookups\n");
+		error_printf("Error - Too many pending MAC address or geoip lookups\n");
 		database_insert_immediately(r);
 		return -ENOSPC;
 	}
@@ -180,7 +288,7 @@ parse_proto_port(struct nlattr **tuple, bool src, uint8_t *proto, uint16_t *port
 static void
 parse_event(void *reply, int len, bool allow_insert, bool update_mac)
 {
-	int err;
+	int err, geo_err;
 	struct nlmsghdr *hdr;
 	struct genlmsghdr *gnlh;
 	static struct nlattr *attr[__CTA_MAX + 1];
@@ -193,6 +301,8 @@ parse_event(void *reply, int len, bool allow_insert, bool update_mac)
 	uint64_t orig_pkts, orig_bytes, reply_pkts, reply_bytes;
 	uint16_t orig_port, reply_port;
 	uint8_t orig_proto, reply_proto;
+
+	int wan_idx;
 
 	for (hdr = reply; nlmsg_ok(hdr, len); hdr = nlmsg_next(hdr, &len)) {
 		gnlh = nlmsg_data(hdr);
@@ -247,6 +357,7 @@ parse_event(void *reply, int len, bool allow_insert, bool update_mac)
 			r.out_pkts = orig_pkts;
 			r.out_bytes = orig_bytes;
 			r.src_addr.in6 = orig_saddr;
+			r.last_ext_addr = orig_daddr;
 		}
 
 		/* remote -> local */
@@ -257,7 +368,36 @@ parse_event(void *reply, int len, bool allow_insert, bool update_mac)
 			r.in_bytes = orig_bytes;
 			r.out_pkts = reply_pkts;
 			r.out_bytes = reply_bytes;
+			r.type = RECORD_TYPE_WAN_IN;
 			r.src_addr.in6 = reply_saddr;
+			r.last_ext_addr = reply_daddr;
+		}
+
+		/* WAN local -> remote */
+		else if ((wan_idx = match_wan(r.family, &reply_daddr)) >= 0) {
+			r.proto = orig_proto;
+			r.dst_port = orig_port;
+			r.in_pkts = reply_pkts;
+			r.in_bytes = reply_bytes;
+			r.out_pkts = orig_pkts;
+			r.out_bytes = orig_bytes;
+			r.src_addr.in6 = orig_saddr;
+			r.type = RECORD_TYPE_WAN;
+			r.src_addr.wan_idx = wan_idx;
+			r.last_ext_addr = orig_daddr;
+		}
+
+		/* WAN remote -> local */
+		else if ((wan_idx = match_wan(r.family, &orig_daddr)) >= 0) {
+			r.proto = reply_proto;
+			r.dst_port = reply_port;
+			r.in_pkts = orig_pkts;
+			r.in_bytes = orig_bytes;
+			r.out_pkts = reply_pkts;
+			r.out_bytes = reply_bytes;
+			r.type = RECORD_TYPE_WAN|RECORD_TYPE_WAN_IN;
+			r.src_addr.wan_idx = wan_idx;
+			r.last_ext_addr = reply_daddr;
 		}
 
 		/* local -> local or remote -> remote */
@@ -265,22 +405,40 @@ parse_event(void *reply, int len, bool allow_insert, bool update_mac)
 			continue;
 		}
 
-		if (!lookup_protocol(r.proto, be16toh(r.dst_port))) {
+		if (!protocol_include(r.proto, be16toh(r.dst_port))) {
 			r.proto = 0;
 			r.dst_port = 0;
 		}
 
 		r.count = htobe64(allow_insert);
 
-		if (update_mac)
-			update_macaddr(r.family, &r.src_addr.in6);
+		if (r.type & RECORD_TYPE_WAN) {
+			err = 0;
+		} else {
+			//if (update_mac)
+			//	update_macaddr(r.family, &r.src_addr.in6);
 
-		err = lookup_macaddr(r.family, &r.src_addr.in6, &r.src_mac.ea);
+			err = lookup_macaddr(r.family, &r.src_addr.in6, &r.src_mac.ea);
+			if (err == -ENOENT)
+				update_macaddr(r.family, &r.src_addr.in6);
+		}
 
-		if (update_mac && err == -ENOENT)
+		geo_err = geoip_lookup(&r);
+
+		if (geo_err == -EINVAL) {
+			debug_printf("parse_event - invalid (bogon) geoip(%s) for ", (r.type & RECORD_TYPE_WAN) ? "wan": format_ipaddr(r.family, &r.src_addr, 1));
+			debug_printf("%s\n", format_ipaddr(r.family, &r.last_ext_addr, 1));
+			continue;
+		}
+
+		if ((geo_err == -EAGAIN) || (update_mac && (err == -ENOENT)))
 			database_insert_delayed(&r);
-		else
+		else {
+			if ((!r.type & RECORD_TYPE_WAN) && !r.src_mac.u64) {
+				debug_printf("database_insert_immediately - no mac addr for %s\n", format_ipaddr(r.family, &r.src_addr, 1));
+			}
 			database_insert_immediately(&r);
+		}
 	}
 }
 
@@ -311,7 +469,7 @@ handle_dump(struct nl_msg *msg, void *arg)
 	struct nlmsghdr *hdr = nlmsg_hdr(msg);
 	bool *allow_insert = arg;
 	parse_event(hdr, hdr->nlmsg_len, *allow_insert, true);
-	return NL_SKIP;
+	return NL_OK;
 }
 
 static int
@@ -327,7 +485,7 @@ handle_finish(struct nl_msg *msg, void *arg)
 {
 	int *ret = arg;
 	*ret = 0;
-	return NL_SKIP;
+	return NL_STOP;
 }
 
 static int
@@ -381,6 +539,7 @@ nfnetlink_connect(int bufsize)
 		return -errno;
 
 	if (nl_socket_add_memberships(nl, NFNLGRP_CONNTRACK_NEW,
+					  //NFNLGRP_CONNTRACK_UPDATE,
 	                                  NFNLGRP_CONNTRACK_DESTROY, 0))
 		return -errno;
 
@@ -490,15 +649,13 @@ nfnetlink_dump(bool allow_insert)
 	if (nl_send_auto_complete(nl, req) < 0)
 		goto err;
 
+	debug_printf("DUMP start\n");
+	nfnetlink_dump_in_progress = 1;
 	for (err = 1; err > 0; ) {
 		ret = nl_recvmsgs(nl, cb);
 
-		if (ret == 0) {
-			err = 0;
-			break;
-		}
-		else if (ret < 0) {
-			fprintf(stderr, "Netlink receive failure: %s\n", nl_geterror(ret));
+		if (ret < 0) {
+			error_printf("Error Netlink receive failure: %s\n", nl_geterror(ret));
 			err = (-ret == NLE_NOMEM) ? -ENOBUFS : -EIO;
 			break;
 		}
@@ -513,5 +670,7 @@ err:
 	if (req)
 		nlmsg_free(req);
 
+	nfnetlink_dump_in_progress = 0;
+	debug_printf("DUMP end\n");
 	return -errno;
 }

@@ -1,8 +1,6 @@
 /*
   ISC License
 
-  Copyright (c) 2016-2017, Jo-Philipp Wich <jo@mein.io>
-
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
   copyright notice and this permission notice appear in all copies.
@@ -16,31 +14,28 @@
   PERFORMANCE OF THIS SOFTWARE.
 */
 
-#ifndef __NEIGH_H__
-#define __NEIGH_H__
+#ifndef __WAN_H__
+#define __WAN_H__
 
+#include <stdint.h>
 #include <netinet/in.h>
-#include <net/ethernet.h>
 
-union neigh_key {
-	uint32_t u32[5];
-	struct {
-		uint8_t family;
-		union {
-			struct in_addr in;
-			struct in6_addr in6;
-		} addr;
-	} data;
+#include <libubox/list.h>
+
+
+struct wan {
+    struct list_head list;
+    uint8_t wan_idx;
+    uint8_t family;
+    union {
+        struct in_addr in;
+        struct in6_addr in6;
+    } addr;
 };
 
-struct neigh_entry {
-	union neigh_key key;
-	struct ether_addr mac;
-	struct avl_node node;
-};
+int add_wan(const char *name, const char *ifname);
+int match_wan(int family, struct in6_addr *addr);
+const char *get_wan_name(int index);
+int wan_read_config(void);
 
-int update_macaddr(int family, const void *addr);
-int lookup_macaddr(int family, const void *addr, struct ether_addr *mac);
-void neigh_ubus_update(int ack, const char *ip, const char *mac);
-
-#endif
+#endif /* __SUBNETS_H__ */

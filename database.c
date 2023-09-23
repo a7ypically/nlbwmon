@@ -16,6 +16,7 @@
   PERFORMANCE OF THIS SOFTWARE.
 */
 
+#include <assert.h>
 #include <endian.h>
 
 #include <stdio.h>
@@ -31,20 +32,56 @@
 #include <sys/types.h>
 
 #include <libubox/avl.h>
+#include <libubox/md5.h>
 
 #include <zlib.h>
 
 #include "nlbwmon.h"
 #include "database.h"
+#include "utils.h"
+#include "wans.h"
 #include "nfnetlink.h"
 
+struct db_archive_cb_entry {
+	struct list_head list;
+	db_archive_cb_fn fn;
+};
+
+static LIST_HEAD(archive_cbs);
 
 struct dbhandle *gdbh = NULL;
+
+#ifdef DEBUG_LOG
+void print_record(struct record *r)
+{
+	const char *src_name;
+	char country[3];
+
+	if (r->type & RECORD_TYPE_WAN) {
+		src_name = get_wan_name(r->src_addr.wan_idx);
+	} else {
+		src_name = format_ipaddr(r->family, &r->src_addr, 1);
+	}
+
+	if (!r->country[0]) {
+		country[0] = '0';
+		country[1] = '0' + country[1];
+	} else {
+		country[0] = r->country[0];
+		country[1] = r->country[1];
+	}
+	country[2] = 0;
+
+	debug_printf("Record - f:%d proto:%d dst_port:%d mac:%s src:%s country:%s lonlat:%d,%d asn:%d\n", r->family, r->proto, r->dst_port, format_macaddr(&r->src_mac.ea), src_name, country, r->lonlat[0], r->lonlat[1], r->asn);
+}
+#else
+#define print_record(R)
+#endif
 
 static int
 database_cmp_index(const void *k1, const void *k2, void *ptr)
 {
-	return memcmp(k1, k2, offsetof(struct record, count));
+	return memcmp(k1, k2, db_keysize);
 }
 
 
@@ -59,7 +96,11 @@ database_reindex(struct dbhandle *h)
 	for (i = 0; i < db_entries(h->db); i++) {
 		ptr = &h->db->records[i];
 		ptr->node.key = ptr;
-		avl_insert(&h->index, &ptr->node);
+		debug_printf("database_reindex - adding record:\n");
+		print_record(ptr);
+		if (avl_insert(&h->index, &ptr->node)) {
+			error_printf("Error database_reindex - adding record.\n");
+		}
 	}
 }
 
@@ -196,12 +237,12 @@ database_mem(avl_tree_comp key_fn, void *key_ptr)
 }
 
 int
-database_insert(struct dbhandle *h, struct record *rec)
+database_insert(struct dbhandle *h, struct record *rec, struct record **db_rec)
 {
 	int err;
 	struct record *ptr;
 
-	err = database_update(h, rec);
+	err = database_update(h, rec, db_rec);
 
 	if (err != -ENOENT)
 		return err;
@@ -213,19 +254,29 @@ database_insert(struct dbhandle *h, struct record *rec)
 		/* database hard limit reached, start overwriting old entries */
 		if (err == -ENOSPC) {
 			ptr = &h->db->records[h->off++ % h->size];
+			debug_printf("database_insert - removing record:\n");
+			print_record(ptr);
 			avl_delete(&h->index, &ptr->node);
 
 			memset(ptr, 0, sizeof(*ptr));
 			memcpy(ptr, rec, db_recsize);
 
 			ptr->node.key = ptr;
-			avl_insert(&h->index, &ptr->node);
+			debug_printf("database_insert - adding record after recycle:\n");
+			print_record(ptr);
+			if (avl_insert(&h->index, &ptr->node)) {
+				error_printf("Error database_insert - Error adding record after recycle.\n");
+			}
 
-			return 0;
+			if (db_rec) *db_rec = ptr;
+
+			return 1;
 		}
 
-		if (err < 0)
+		if (err < 0) {
+			error_printf("Error in database_grow.");
 			return err;
+		}
 	}
 
 	h->db->entries = htobe32(db_entries(h->db) + 1);
@@ -236,26 +287,36 @@ database_insert(struct dbhandle *h, struct record *rec)
 	memcpy(ptr, rec, db_recsize);
 
 	ptr->node.key = ptr;
-	avl_insert(&h->index, &ptr->node);
 
-	return 0;
+	debug_printf("database_insert - adding record:\n");
+	print_record(ptr);
+	if (avl_insert(&h->index, &ptr->node)) {
+		error_printf("Error - database_insert - Error adding record.\n");
+	}
+
+	if (db_rec) *db_rec = ptr;
+	return 1;
 }
 
 #define add64(x, y) x = htobe64(be64toh(x) + be64toh(y))
 
 int
-database_update(struct dbhandle *h, struct record *rec)
+database_update(struct dbhandle *h, struct record *rec, struct record **db_rec)
 {
 	struct record *ptr;
 
 	ptr = avl_find_element(&h->index, rec, ptr, node);
 
 	if (ptr) {
+		ptr->last_ext_addr = rec->last_ext_addr;
 		add64(ptr->count, rec->count);
 		add64(ptr->in_pkts, rec->in_pkts);
 		add64(ptr->in_bytes, rec->in_bytes);
 		add64(ptr->out_pkts, rec->out_pkts);
 		add64(ptr->out_bytes, rec->out_bytes);
+		ptr->flags |= rec->flags;
+
+		if (db_rec) *db_rec = ptr;
 
 		return 0;
 	}
@@ -383,7 +444,7 @@ database_save(struct dbhandle *h, const char *path, uint32_t timestamp,
 	struct stat s;
 	int err;
 
-	snprintf(file, sizeof(file), "%s/%u.db%s",
+	snprintf(file, sizeof(file), "%s/db_%u_v2.db%s",
 	         path, timestamp, compress ? ".gz" : "");
 
 	/* If the database is pristine (was not read from disk), there must
@@ -461,7 +522,7 @@ database_restore_gzip(struct dbhandle *h, const char *path, uint32_t timestamp)
 				return -ERANGE;
 			}
 
-			database_insert(h, &rec);
+			database_insert(h, &rec, NULL);
 		}
 
 		if (gzgetc(gz) != -1) {
@@ -529,7 +590,7 @@ database_restore_mmap(struct dbhandle *h, const char *path, uint32_t timestamp,
 	h->pristine = false;
 
 	for (i = 0; i < entries; i++)
-		database_insert(h, db_diskrecord(db, i));
+		database_insert(h, db_diskrecord(db, i), NULL);
 
 out:
 	if (db != MAP_FAILED)
@@ -547,12 +608,12 @@ database_load(struct dbhandle *h, const char *path, uint32_t timestamp)
 	char name[256];
 	struct stat s;
 
-	snprintf(name, sizeof(name), "%s/%u.db.gz", path, timestamp);
+	snprintf(name, sizeof(name), "%s/db_%u_v2.db.gz", path, timestamp);
 
 	if (!stat(name, &s))
 		return database_restore_gzip(h, name, timestamp);
 
-	snprintf(name, sizeof(name), "%s/%u.db", path, timestamp);
+	snprintf(name, sizeof(name), "%s/db_%u_v2.db", path, timestamp);
 
 	if (!stat(name, &s))
 		return database_restore_mmap(h, name, timestamp, s.st_size);
@@ -565,7 +626,7 @@ database_cleanup(void)
 {
 	uint32_t timestamp, num;
 	struct dirent *entry;
-	char *e, path[256];
+	char *e, path[300];
 	DIR *d;
 
 	if (!opt.db.generations)
@@ -583,21 +644,32 @@ database_cleanup(void)
 		if (entry->d_type != DT_REG)
 			continue;
 
-		num = strtoul(entry->d_name, &e, 10);
-
-		if (e == entry->d_name || *e != '.')
+		char *suffix = strstr(entry->d_name, "_v2.db");
+		if (!suffix)
 			continue;
 
-		if (strcmp(e, ".db") != 0 && strcmp(e, ".db.gz") != 0)
+		if (strcmp("_v2.db", suffix) && strcmp("_v2.db.gz", suffix))
+			continue;
+
+		char *num_start = suffix - 1;
+
+		while ((num_start > entry->d_name) && (*(num_start-1) != '_')) num_start -= 1;
+
+		num = strtoul(num_start, &e, 10);
+
+		if ((e == num_start) || (*e != '_') || (num == 0))
+			continue;
+
+		if (strcmp(e, "_v2.db") != 0 && strcmp(e, "_v2.db.gz") != 0)
 			continue;
 
 		if (num < 20000101 || num > timestamp)
 			continue;
 
-		snprintf(path, sizeof(path), "%s/%u%s", opt.db.directory, num, e);
+		snprintf(path, sizeof(path), "%s/%s", opt.db.directory, entry->d_name);
 
 		if (unlink(path))
-			fprintf(stderr, "Unable to delete %s: %s\n", path, strerror(errno));
+			fprintf(stderr, "Error Unable to delete %s: %s\n", path, strerror(errno));
 	}
 
 	closedir(d);
@@ -628,6 +700,12 @@ database_archive(struct dbhandle *h)
 		/* carry over yet open streams to new database */
 		err = nfnetlink_dump(true);
 
+		struct db_archive_cb_entry *entry;
+
+		list_for_each_entry(entry, &archive_cbs, list) {
+			entry->fn(opt.db.directory, curr_ts);
+		}
+
 		if (err)
 			return err;
 
@@ -643,3 +721,58 @@ database_free(struct dbhandle *h)
 	free(h->db);
 	free(h);
 }
+
+int database_get_idx(struct record *r, uint32_t *md5)
+{
+	struct record *db_start = gdbh->db->records;
+	int idx = r - db_start;
+	assert(r == &gdbh->db->records[idx]);
+
+	md5_ctx_t ctx;
+	memset(md5, 0, sizeof(*md5) * 4);
+	md5_begin(&ctx);
+	md5_hash(r, db_keysize, &ctx);
+	md5_end(md5, &ctx);
+
+	return idx;
+}
+
+struct record *database_get_by_idx(int idx, uint32_t *md5)
+{
+	if (idx > gdbh->db->entries) return NULL;
+
+	struct record *r = &gdbh->db->records[idx];
+
+	uint32_t r_md5[4];
+
+	md5_ctx_t ctx;
+	memset(r_md5, 0, sizeof(*r_md5) * 4);
+	md5_begin(&ctx);
+	md5_hash(r, db_keysize, &ctx);
+	md5_end(r_md5, &ctx);
+
+	if (memcmp(r_md5, md5, sizeof(r_md5))) {
+		debug_printf("database_get_by_idx (%d), md5 mismatch.\n", idx);
+		return NULL;
+	}
+
+	return r;
+}
+
+void database_add_archive_cb(db_archive_cb_fn fn)
+{
+	struct db_archive_cb_entry *entry = (struct db_archive_cb_entry *)calloc(1, sizeof(*entry));
+	entry->fn = fn;
+	list_add_tail(&entry->list, &archive_cbs);
+}
+
+struct record *database_find(const void *key, uint32_t size) {
+	assert(size == db_keysize);
+
+	struct record *ptr;
+
+	ptr = avl_find_element(&gdbh->index, key, ptr, node);
+
+	return ptr;
+}
+

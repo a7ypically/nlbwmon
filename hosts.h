@@ -1,7 +1,6 @@
 /*
   ISC License
 
-  Copyright (c) 2016-2017, Jo-Philipp Wich <jo@mein.io>
 
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
@@ -15,32 +14,30 @@
   OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
   PERFORMANCE OF THIS SOFTWARE.
 */
-
-#ifndef __NEIGH_H__
-#define __NEIGH_H__
+#ifndef __HOSTS_H__
+#define __HOSTS_H__
 
 #include <netinet/in.h>
 #include <net/ethernet.h>
 
-union neigh_key {
-	uint32_t u32[5];
-	struct {
-		uint8_t family;
-		union {
-			struct in_addr in;
-			struct in6_addr in6;
-		} addr;
-	} data;
-};
+#define MAX_HOST_NAME 31
 
-struct neigh_entry {
-	union neigh_key key;
-	struct ether_addr mac;
+#define TYPE_NO_NAME	   0
+#define TYPE_DHCP_PROVIDED 1
+#define TYPE_USER_PROVIDED 2
+
+struct hosts_record_entry {
+	uint8_t type;
+	struct ether_addr mac_addr;
+	char hostname[MAX_HOST_NAME];
 	struct avl_node node;
 };
 
-int update_macaddr(int family, const void *addr);
-int lookup_macaddr(int family, const void *addr, struct ether_addr *mac);
-void neigh_ubus_update(int ack, const char *ip, const char *mac);
+int hosts_update(const char *name, const char *macaddr, uint8_t type);
+int hosts_update_by_addr(const char *name, struct ether_addr *addr, uint8_t type);
+const char *lookup_hostname(struct ether_addr *macaddr);
+int hosts_is_known(struct ether_addr *macaddr);
+int init_hosts(const char *db_path, uint32_t timestamp);
+int hosts_is_new(struct ether_addr *macaddr);
 
 #endif

@@ -1,8 +1,6 @@
 /*
   ISC License
 
-  Copyright (c) 2016-2017, Jo-Philipp Wich <jo@mein.io>
-
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
   copyright notice and this permission notice appear in all copies.
@@ -16,31 +14,27 @@
   PERFORMANCE OF THIS SOFTWARE.
 */
 
-#ifndef __NEIGH_H__
-#define __NEIGH_H__
+#ifndef __TG_H__
+#define __TG_H__
 
 #include <netinet/in.h>
-#include <net/ethernet.h>
+#include "database.h"
+#include "ustream-ssl.h"
 
-union neigh_key {
-	uint32_t u32[5];
-	struct {
-		uint8_t family;
-		union {
-			struct in_addr in;
-			struct in6_addr in6;
-		} addr;
-	} data;
-};
+extern char *tg_host;
+extern char *tg_port;
 
-struct neigh_entry {
-	union neigh_key key;
-	struct ether_addr mac;
-	struct avl_node node;
-};
-
-int update_macaddr(int family, const void *addr);
-int lookup_macaddr(int family, const void *addr, struct ether_addr *mac);
-void neigh_ubus_update(int ack, const char *ip, const char *mac);
+int tg_send_msg(const char *msg);
+const char *tg_get_token(void);
+void tg_send_set_chat_id(int chat_id, char *bot_token);
+void tg_notify_incoming(struct record *r);
+void tg_notify_outgoing(struct record *r);
+void tg_notify_upload(struct record *r);
+void tg_notify_new_client(struct ether_addr *mac);
+void tg_on_poll_callback(int chat_id, int message_id, char *callback_query_id, char *callback_data);
+void tg_on_poll_text(int chat_id, int message_id, char *text);
+void tg_on_poll_pinned(int chat_id, int message_id);
+int init_tg_poll(void);
+int init_tg(const char *db_path);
 
 #endif

@@ -146,7 +146,7 @@ handle_commit(int sock, const char *arg)
 	char buf[128];
 	int err, len;
 
-	err = database_save(gdbh, opt.db.directory, timestamp, opt.db.compress);
+	err = nlbwmon_save_persistent(timestamp);
 	len = snprintf(buf, sizeof(buf), "%d %s", -err,
 	               err ? strerror(-err) : "ok");
 

@@ -33,6 +33,7 @@
 #include "client.h"
 #include "database.h"
 #include "protocol.h"
+#include "wans.h"
 #include "utils.h"
 
 #include "nlbwmon.h"
@@ -67,7 +68,11 @@ enum {
 	HOST     = 10,
 	LAYER7   = 11,
 
-	MAX      = 12
+	COUNTRY  = 12,
+	LONLAT   = 13,
+	ASN      = 14,
+
+	MAX      = 15
 };
 
 static struct field fields[MAX] = {
@@ -86,7 +91,10 @@ static struct field fields[MAX] = {
 	  offsetof(struct record, count) - offsetof(struct record, src_mac) },
 
 	[LAYER7]   = { "layer7", offsetof(struct record, proto),
-	  offsetof(struct record, src_mac) - offsetof(struct record, proto) }
+	  offsetof(struct record, src_mac) - offsetof(struct record, proto) },
+	[COUNTRY]  = f("country", country),
+	[LONLAT]   = f("lonlat", lonlat),
+	[ASN]      = f("asn", asn)
 };
 
 
@@ -249,9 +257,9 @@ recv_database(struct dbhandle **h)
 			return -ENODATA;
 		}
 
-		err = database_insert(*h, &rec);
+		err = database_insert(*h, &rec, NULL);
 
-		if (err != 0) {
+		if (err < 0) {
 			close(ctrl_socket);
 			return err;
 		}
@@ -269,7 +277,6 @@ handle_show(void)
 	struct dbhandle *h = NULL;
 	struct record *rec = NULL;
 	char columns[MAX] = { };
-	struct protocol *pr;
 	int8_t i, r, n;
 	int err;
 
@@ -318,18 +325,31 @@ handle_show(void)
 			printf("%c Port ", columns[PORT]);
 	}
 
+	if (columns[COUNTRY]) {
+		printf("%c Country ", columns[COUNTRY]);
+	}
+
+	if (columns[LONLAT]) {
+		printf("%c lonlat ", columns[LONLAT]);
+	}
+
+	if (columns[ASN]) {
+		printf("%c asn ", columns[ASN]);
+	}
+
 	printf("  %c Conn.   %c Downld. ( %c Pkts. )    %c Upload ( %c Pkts. )\n",
 	       columns[CONNS],
 	       columns[RX_BYTES], columns[RX_PKTS],
 	       columns[TX_BYTES], columns[TX_PKTS]);
 
 	while ((rec = database_next(h, rec)) != NULL) {
+		if (rec->type & RECORD_TYPE_WAN) continue;
 		if (columns[FAMILY])
 			printf("IPv%d  ", rec->family == AF_INET ? 4 : 6);
 
 		if (columns[HOST]) {
 			printf("%15s (%02x:%02x:%02x)  ",
-			       format_ipaddr(rec->family, &rec->src_addr),
+			       format_ipaddr(rec->family, &rec->src_addr, 1),
 			       rec->src_mac.ea.ether_addr_octet[3],
 			       rec->src_mac.ea.ether_addr_octet[4],
 			       rec->src_mac.ea.ether_addr_octet[5]);
@@ -339,12 +359,11 @@ handle_show(void)
 				printf("%17s  ", format_macaddr(&rec->src_mac.ea));
 
 			if (columns[IP])
-				printf("%15s  ", format_ipaddr(rec->family, &rec->src_addr));
+				printf("%15s  ", format_ipaddr(rec->family, &rec->src_addr, 1));
 		}
 
 		if (columns[LAYER7]) {
-			pr = lookup_protocol(rec->proto, be16toh(rec->dst_port));
-			printf("%10s  ", pr ? pr->name : "other");
+			printf("%10s  ", get_protocol_name(rec->proto, be16toh(rec->dst_port)));
 		}
 		else {
 			if (columns[PROTO])
@@ -352,6 +371,18 @@ handle_show(void)
 
 			if (columns[PORT])
 				printf("%5u  ", be16toh(rec->dst_port));
+		}
+
+		if (columns[COUNTRY]) {
+			printf("   %c%c   ", rec->country[0], rec->country[1]);
+		}
+
+		if (columns[LONLAT]) {
+			printf("%f,%f", rec->lonlat[0]/1000000.0, rec->lonlat[1]/1000000.0);
+		}
+
+		if (columns[ASN]) {
+			printf("%d", rec->asn);
 		}
 
 		printf("%s  ",   format_num(rec->count));
@@ -372,7 +403,6 @@ handle_json(void)
 	struct dbhandle *h = NULL;
 	struct record *rec = NULL;
 	char columns[MAX] = { };
-	struct protocol *pr;
 	int8_t i, r, n;
 	int err;
 
@@ -414,6 +444,7 @@ handle_json(void)
 	printf("],\"data\":[");
 
 	while ((rec = database_next(h, rec)) != NULL) {
+		if (rec->type & RECORD_TYPE_WAN) continue;
 		if (!r)
 			r++;
 		else
@@ -443,11 +474,7 @@ handle_json(void)
 				break;
 
 			case LAYER7:
-				pr = lookup_protocol(rec->proto, be16toh(rec->dst_port));
-				if (pr)
-					printf("\"%s\"", pr->name);
-				else
-					printf("null");
+				printf("\"%s\"", get_protocol_name(rec->proto, be16toh(rec->dst_port)));
 				break;
 
 			case MAC:
@@ -455,7 +482,7 @@ handle_json(void)
 				break;
 
 			case IP:
-				printf("\"%s\"", format_ipaddr(rec->family, &rec->src_addr));
+				printf("\"%s\"", format_ipaddr(rec->family, &rec->src_addr, 1));
 				break;
 
 			case CONNS:
@@ -477,6 +504,18 @@ handle_json(void)
 			case TX_PKTS:
 				printf("%"PRIu64, be64toh(rec->out_pkts));
 				break;
+
+			case COUNTRY:
+				if (rec->country[0]) printf("\"%c%c\"", rec->country[0], rec->country[1]);
+				else printf("\"\"");
+				break;
+			case LONLAT:
+				printf("[%f,%f]", rec->lonlat[0]/1000000.0, rec->lonlat[1]/1000000.0);
+				break;
+			case ASN:
+				printf("%d", rec->asn);
+				break;
+
 			}
 		}
 
@@ -496,7 +535,6 @@ handle_csv(void)
 	struct dbhandle *h = NULL;
 	struct record *rec = NULL;
 	char columns[MAX] = { };
-	struct protocol *pr;
 	int8_t i, n;
 	int err;
 
@@ -558,9 +596,7 @@ handle_csv(void)
 				break;
 
 			case LAYER7:
-				pr = lookup_protocol(rec->proto, be16toh(rec->dst_port));
-				if (pr)
-					print_csv_str(pr->name);
+				print_csv_str(get_protocol_name(rec->proto, be16toh(rec->dst_port)));
 				break;
 
 			case MAC:
@@ -568,7 +604,7 @@ handle_csv(void)
 				break;
 
 			case IP:
-				print_csv_str(format_ipaddr(rec->family, &rec->src_addr));
+				print_csv_str(format_ipaddr(rec->family, &rec->src_addr, 1));
 				break;
 
 			case CONNS:
@@ -800,6 +836,8 @@ client_main(int argc, char **argv)
 		        opt.protocol_db, strerror(-err));
 		return 1;
 	}
+
+	wan_read_config();	
 
 	err = cmd->fn();
 

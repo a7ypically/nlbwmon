@@ -51,9 +51,25 @@
 #include "socket.h"
 #include "client.h"
 #include "utils.h"
+#include "ubus.h"
+#include "wans.h"
+#include "geoip.h"
+#include "asn.h"
+#include "dns.h"
+#include "hosts.h"
+#include "notify.h"
+#include "abuseipdb.h"
+#include "tg.h"
 
 static struct uloop_timeout commit_tm = { };
 static struct uloop_timeout refresh_tm = { };
+
+struct db_persistence_entry {
+	struct list_head list;
+	db_persistence_cb_fn fn;
+};
+
+static LIST_HEAD(persistence_cbs);
 
 struct options opt = {
 	.commit_interval = 86400,
@@ -61,7 +77,7 @@ struct options opt = {
 
 	.netlink_buffer_size = 524288,
 
-	.tempdir = "/tmp",
+	.tempdir = "/tmp/nlbwmon",
 	.socket = "/var/run/nlbwmon.sock",
 	.protocol_db = "/usr/share/nlbwmon/protocols",
 
@@ -71,7 +87,7 @@ struct options opt = {
 };
 
 
-static void save_persistent(uint32_t timestamp)
+int nlbwmon_save_persistent(uint32_t timestamp)
 {
 	int err;
 
@@ -93,7 +109,16 @@ static void save_persistent(uint32_t timestamp)
 	if (err) {
 		fprintf(stderr, "Unable to save database: %s\n",
 		        strerror(-err));
+		return err;
 	}
+
+	struct db_persistence_entry *persist;
+
+	list_for_each_entry(persist, &persistence_cbs, list) {
+		persist->fn(opt.db.directory, timestamp);
+	}
+
+	return 0;
 }
 
 static void handle_shutdown(int sig)
@@ -101,7 +126,7 @@ static void handle_shutdown(int sig)
 	char path[256];
 	uint32_t timestamp = interval_timestamp(&opt.archive_interval, 0);
 
-	save_persistent(timestamp);
+	nlbwmon_save_persistent(timestamp);
 
 	if (sig == SIGTERM) {
 		snprintf(path, sizeof(path), "%s/0.db", opt.tempdir);
@@ -121,7 +146,7 @@ handle_commit(struct uloop_timeout *tm)
 	uint32_t timestamp = interval_timestamp(&opt.archive_interval, 0);
 
 	uloop_timeout_set(tm, opt.commit_interval * 1000);
-	save_persistent(timestamp);
+	nlbwmon_save_persistent(timestamp);
 }
 
 static void
@@ -205,7 +230,7 @@ server_main(int argc, char **argv)
 	int optchr, err;
 	char *e;
 
-	while ((optchr = getopt(argc, argv, "b:i:r:s:o:p:G:I:L:PZ")) > -1) {
+	while ((optchr = getopt(argc, argv, "b:i:r:s:w:o:p:G:I:L:PZ")) > -1) {
 		switch (optchr) {
 		case 'b':
 			opt.netlink_buffer_size = (int)strtol(optarg, &e, 0);
@@ -240,6 +265,26 @@ server_main(int argc, char **argv)
 				fprintf(stderr, "Invalid subnet '%s': %s\n",
 				        optarg, strerror(-err));
 				return 1;
+			}
+			break;
+
+		case 'w':
+			if (!strchr(optarg, ':')) {
+				fprintf(stderr, "Invalid wan value '%s'\n",
+				        optarg);
+				return 1;
+			} else {
+				char *name, *iface;
+				name = strdup(optarg);
+				iface = strchr(optarg, ':');
+				*iface = 0;
+				iface++;
+				err = add_wan(name, iface);
+				if (err) {
+					fprintf(stderr, "Error adding wan '%s': %s\n",
+						optarg, strerror(-err));
+					return 1;
+				}
 			}
 			break;
 
@@ -311,10 +356,10 @@ server_main(int argc, char **argv)
 		return 1;
 	}
 
+	timestamp = interval_timestamp(&opt.archive_interval, 0);
 	err = database_load(gdbh, opt.tempdir, 0);
 
 	if (err == -ENOENT) {
-		timestamp = interval_timestamp(&opt.archive_interval, 0);
 		err = database_load(gdbh, opt.db.directory, timestamp);
 	}
 
@@ -325,6 +370,13 @@ server_main(int argc, char **argv)
 	}
 
 	err = init_protocols(opt.protocol_db);
+	init_geoip_mmap(opt.db.directory);
+	init_asn_mmap(opt.db.directory, timestamp);
+	init_dns(opt.db.directory, timestamp);
+	init_hosts(opt.db.directory, timestamp);
+	init_notify(opt.db.directory);
+	init_abuseipdb();
+	init_tg(opt.db.directory);
 
 	if (err) {
 		fprintf(stderr, "Unable to read protocol list %s: %s\n",
@@ -359,9 +411,26 @@ server_main(int argc, char **argv)
 	refresh_tm.cb = handle_refresh;
 	uloop_timeout_set(&refresh_tm, opt.refresh_interval * 1000);
 
+	init_ubus();
+
+	err = nfnetlink_dump(true);
+
+	if (err) {
+		fprintf(stderr, "Unable to dump conntrack: %s\n",
+		        strerror(-err));
+		return -1;
+	}
+
 	uloop_run();
 
 	return 0;
+}
+
+void nlbwmon_add_presistence_cb(db_persistence_cb_fn fn)
+{
+	struct db_persistence_entry *entry = (struct db_persistence_entry *)calloc(1, sizeof(*entry));
+	entry->fn = fn;
+	list_add_tail(&entry->list, &persistence_cbs);
 }
 
 int

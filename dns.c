@@ -56,7 +56,7 @@ int dns_update(const char *name, const char *addr)
 	debug_printf("dns_update - %s %s\n", name, addr);
 
 	int len = strlen(name);
-	char c_name[MAX_DNS_LEN];
+	char c_name[MAX_DNS_LEN+1];
 
 	if (len > MAX_DNS_LEN) {
 		c_name[0] = '.';

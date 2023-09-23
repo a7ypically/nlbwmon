@@ -179,6 +179,7 @@ static void tg_api_reply_callback(void)
 		data_len = snprintf(data, sizeof(data), "callback_query_id=%s", CallbackQueryID);
 		assert(data_len < sizeof(data));
 	}
+	_unused(data_len);
 
 	free(CallbackQueryID);
 	CallbackQueryID = NULL;
@@ -186,6 +187,7 @@ static void tg_api_reply_callback(void)
 
 	int url_len = snprintf(url, sizeof(url), "/bot%s/answerCallbackQuery", TGBotToken);
 	assert(url_len < sizeof(url));
+	_unused(url_len);
 
 	tg_send_msg_state = TG_SEND_STATE_IN_PROG;
 
@@ -218,6 +220,7 @@ static void tg_api_send_msg(char *msg)
 		url_len = snprintf(url, sizeof(url), "/bot%s/sendMessage", TGBotToken);
 		assert(url_len < sizeof(url));
 	}
+	_unused(url_len);
 
 	if (TGInlineKeys[0][0]) {
 		char inline_keyboard[512];
@@ -361,7 +364,7 @@ static void tg_format_inline_keys(struct tg_msg_entry *msg, char *msg_str, int m
 	} else if (TGCallbackState[0] == 2) {
 		const char *categories[] = {"Port Scan", "14", "Brute-Force", "18", "SSH", "22", "IoT Targeted", "23"};
 
-		for (int i; i<sizeof(categories)/sizeof(categories[0])/2; ++i) {
+		for (int i=0; i<sizeof(categories)/sizeof(categories[0])/2; ++i) {
 			int cat_id = atoi(categories[i*2+1]);
 			int exist = 0;
 			for (int j=1; j<sizeof(TGCallbackState); ++j) {
@@ -439,7 +442,7 @@ static void tg_get_host_names(struct record *r, char *str, int size) {
 static void tg_format_incoming(struct record *r, struct tg_msg_entry *tg_msg)
 {
 	char msg[1024];
-	const char *client_name;
+	const char *client_name = NULL;
 	char *ext_str = strdup(format_ipaddr(r->family, &r->last_ext_addr, 1));
 	int len = 0;
 
@@ -483,7 +486,7 @@ static void tg_format_incoming(struct record *r, struct tg_msg_entry *tg_msg)
 static void tg_format_outgoing(struct record *r, struct tg_msg_entry *tg_msg)
 {
 	char msg[1024];
-	const char *client_name;
+	const char *client_name = NULL;
 	char *ext_str = strdup(format_ipaddr(r->family, &r->last_ext_addr, 1));
 	char domains[256];
 	int len = 0;
@@ -528,7 +531,7 @@ static void tg_format_outgoing(struct record *r, struct tg_msg_entry *tg_msg)
 static void tg_format_upload(struct record *r, struct tg_msg_entry *tg_msg)
 {
 	char msg[1024];
-	const char *client_name;
+	const char *client_name = NULL;
 	char *ext_str = strdup(format_ipaddr(r->family, &r->last_ext_addr, 1));
 	char domains[256];
 	int len = 0;

@@ -156,7 +156,7 @@ database_insert_immediately(struct record *r)
 static void
 database_insert_delayed_cb(struct uloop_timeout *t)
 {
-	int err;
+	int err = 0;
 	struct delayed_record *dr;
 
 	dr = container_of(t, struct delayed_record, timeout);

@@ -22,7 +22,7 @@
 
 #include <libubox/usock.h>
 #include <libubox/uloop.h>
-#include "ustream-ssl.h"
+#include <libubox/ustream-ssl.h>
 
 #include "utils.h"
 #include "https.h"

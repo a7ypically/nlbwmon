@@ -34,6 +34,8 @@
     fprintf(stderr, fmt, ##__VA_ARGS__); \
 } while (0)
 
+#define _unused(x) ((void)(x))
+
 int rmkdir(const char *path);
 
 char * format_macaddr(struct ether_addr *mac);

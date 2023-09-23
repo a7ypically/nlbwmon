@@ -18,8 +18,8 @@
 #define __TG_H__
 
 #include <netinet/in.h>
+#include <libubox/ustream-ssl.h>
 #include "database.h"
-#include "ustream-ssl.h"
 
 extern char *tg_host;
 extern char *tg_port;

@@ -100,6 +100,7 @@ int abuseipdb_report(const char *addr, const char *categories, AbuseipdbCB cb, v
 
 	int data_len = snprintf(data, sizeof(data), "key=%s&ip=%s&categories=%s", AbuseipdbToken, urlencode(addr), categories);
 	assert(data_len < sizeof(data));
+	_unused(data_len);
 
 	AbuseipdbInProgress = 1;
 

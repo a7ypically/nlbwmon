@@ -22,152 +22,269 @@
 #include <endian.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
-
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <libubox/list.h>
+#include <libubox/uloop.h>
+#include <net/if.h>      // For if_indextoname
+#include <unistd.h>      // For close()
+#include <sys/socket.h>  // For struct msghdr
 
 #include "utils.h"
 #include "uci.h"
 #include "wans.h"
 
-#define MAX_WANS 4
+#define MAX_WANS 5
 
 static LIST_HEAD(wans);
 static const char *wan_indx_arr[MAX_WANS];
 static int num_wans;
 
+struct wan_monitor {
+    struct uloop_fd ufd;
+    int nl_sock;
+};
+
+static struct wan_monitor wan_mon;
+
+static void wan_handle_interface_event(struct uloop_fd *u, unsigned int events)
+{
+    char buf[4096];
+    struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+    struct sockaddr_nl snl;
+    struct msghdr msg = {
+        .msg_name = &snl,
+        .msg_namelen = sizeof(snl),
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = NULL,
+        .msg_controllen = 0,
+        .msg_flags = 0
+    };
+    struct nlmsghdr *h;
+    int len;
+
+    while ((len = recvmsg(u->fd, &msg, MSG_DONTWAIT)) > 0) {
+        for (h = (struct nlmsghdr *)buf; NLMSG_OK(h, len); h = NLMSG_NEXT(h, len)) {
+            if (h->nlmsg_type == NLMSG_DONE)
+                return;
+
+            if (h->nlmsg_type == NLMSG_ERROR)
+                return;
+
+            if (h->nlmsg_type != RTM_NEWADDR && h->nlmsg_type != RTM_DELADDR)
+                continue;
+
+            struct ifaddrmsg *ifa = NLMSG_DATA(h);
+            struct rtattr *rta = IFA_RTA(ifa);
+            int rtl = IFA_PAYLOAD(h);
+            char ifname[IFNAMSIZ] = {0};
+
+            if (!if_indextoname(ifa->ifa_index, ifname))
+                continue;
+
+            struct wan *w = NULL;
+            list_for_each_entry(w, &wans, list) {
+                if (strcmp(w->ifname, ifname) == 0)
+                    break;
+            }
+            if (!w)
+                continue;
+
+            while (rtl && RTA_OK(rta, rtl)) {
+                if (rta->rta_type == IFA_ADDRESS || rta->rta_type == IFA_LOCAL) {
+                    if (h->nlmsg_type == RTM_DELADDR) {
+                        if (ifa->ifa_family == AF_INET) {
+                            memset(&w->ipv4_addr, 0, sizeof(w->ipv4_addr));
+                        } else if (ifa->ifa_family == AF_INET6) {
+                            memset(&w->ipv6_addr, 0, sizeof(w->ipv6_addr));
+                        }
+                        debug_printf("Removed %s address from WAN %s\n",
+                                     ifa->ifa_family == AF_INET ? "IPv4" : "IPv6", w->ifname);
+                    } else if (h->nlmsg_type == RTM_NEWADDR) {
+                        if (ifa->ifa_family == AF_INET && w->ipv4_addr.s_addr == 0) {
+                            w->ipv4_addr.s_addr = be32toh(((struct in_addr *)RTA_DATA(rta))->s_addr);
+                            debug_printf("Assigned IPv4 address %s to WAN %s\n",
+                                         format_ipaddr(AF_INET, &w->ipv4_addr, 1), w->ifname);
+                        } else if (ifa->ifa_family == AF_INET6 && IN6_IS_ADDR_UNSPECIFIED(&w->ipv6_addr)) {
+                            w->ipv6_addr = *((struct in6_addr *)RTA_DATA(rta));
+                            debug_printf("Assigned IPv6 address %s to WAN %s\n",
+                                         format_ipaddr(AF_INET6, &w->ipv6_addr, 1), w->ifname);
+                        }
+                    }
+                }
+                rta = RTA_NEXT(rta, rtl);
+            }
+
+            w->is_up = (w->ipv4_addr.s_addr != 0) || !IN6_IS_ADDR_UNSPECIFIED(&w->ipv6_addr);
+            debug_printf("WAN interface %s %s (idx: %d)\n",
+                         ifname, w->is_up ? "up" : "down", w->wan_idx);
+        }
+    }
+}
+
+static int wan_monitor_init(void)
+{
+    struct sockaddr_nl addr;
+    int sock;
+
+    sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (sock < 0) {
+        error_printf("Failed to create netlink socket: %s\n", strerror(errno));
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.nl_family = AF_NETLINK;
+    addr.nl_groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        error_printf("Failed to bind netlink socket: %s\n", strerror(errno));
+        close(sock);
+        return -1;
+    }
+
+    wan_mon.nl_sock = sock;
+    wan_mon.ufd.fd = sock;
+    wan_mon.ufd.cb = wan_handle_interface_event;
+
+    uloop_fd_add(&wan_mon.ufd, ULOOP_READ);
+    return 0;
+}
+
 int
 add_wan(const char *name, const char *iface)
 {
-	struct ifaddrs *ifaddr;
-	int family;
-	int wan_idx = num_wans;
+    struct ifaddrs *ifaddr;
+    struct wan *w;
+    int wan_idx = num_wans;
 
-	if (num_wans == MAX_WANS)
-		return -ENOMEM;
+    if (num_wans == MAX_WANS)
+        return -ENOMEM;
 
-	wan_indx_arr[num_wans++] = name;
+    wan_indx_arr[num_wans++] = name;
 
-	if (getifaddrs(&ifaddr) == -1) {
-		error_printf("Error - getifaddrs:%s\n", strerror(errno));
-		return -ENOENT;
-	}
+    w = calloc(1, sizeof(*w));
+    if (!w)
+        return -ENOMEM;
 
-	for (struct ifaddrs *ifa = ifaddr; ifa != NULL;
-			ifa = ifa->ifa_next) {
+    w->wan_idx = wan_idx;
+    w->is_up = 0; // Assume down until we find it's up
+    strncpy(w->ifname, iface, IFNAMSIZ - 1);
+    w->ifname[IFNAMSIZ - 1] = '\0';
 
-		if (ifa->ifa_addr == NULL)
-			continue;
+    if (getifaddrs(&ifaddr) == -1) {
+        error_printf("Error - getifaddrs:%s\n", strerror(errno));
+        free(w);
+        return -ENOENT;
+    }
 
-		if (strcmp(ifa->ifa_name, iface))
-			continue;
+    for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
 
-		family = ifa->ifa_addr->sa_family;
+        if (strcmp(ifa->ifa_name, iface))
+            continue;
 
-		if ((family != AF_INET) && (family != AF_INET6))
-			continue;
+        int family = ifa->ifa_addr->sa_family;
 
-		struct wan *w = calloc(1, sizeof(*w));
+        if (family == AF_INET && w->ipv4_addr.s_addr == 0) {
+            w->ipv4_addr.s_addr = be32toh(((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr);
+            w->is_up = 1; // Mark as up if we have at least one address
+            debug_printf("Assigned IPv4 address %s to WAN %s\n",
+                         format_ipaddr(AF_INET, &w->ipv4_addr, 1), w->ifname);
+        } else if (family == AF_INET6 && IN6_IS_ADDR_UNSPECIFIED(&w->ipv6_addr)) {
+            w->ipv6_addr = ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+            w->is_up = 1; // Mark as up if we have at least one address
+            debug_printf("Assigned IPv6 address %s to WAN %s\n",
+                         format_ipaddr(AF_INET6, &w->ipv6_addr, 1), w->ifname);
+        }
+    }
 
-		if (!w) {
-			freeifaddrs(ifaddr);
-			return -ENOMEM;
-		}
+    freeifaddrs(ifaddr);
 
-		w->wan_idx = wan_idx;
-		w->family = family;
+    debug_printf("Adding WAN %s iface:%s %s\n",
+                 name,
+                 w->ifname,
+                 w->is_up ? "up" : "down");
 
-		if (family == AF_INET) {
-			w->addr.in.s_addr = be32toh(((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr);
-		} else {
-			w->addr.in6 = ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
-		}
-
-		debug_printf("Adding wan %s iface:%s %s (%d) %s\n",
-				name,
-				ifa->ifa_name,
-				(family == AF_INET) ? "AF_INET" :
-				(family == AF_INET6) ? "AF_INET6" : "???",
-				family,
-				(family == AF_INET) ? format_ipaddr(family, &w->addr.in, 1) : format_ipaddr(family, &w->addr.in6, 1));
-
-		list_add_tail(&w->list, &wans);
-	}
-
-	freeifaddrs(ifaddr);
-	return 0;
+    list_add_tail(&w->list, &wans);
+    return 0;
 }
 
 int
 match_wan(int family, struct in6_addr *addr)
 {
-	struct wan *w;
-	uint32_t *a, *b;
+    struct wan *w;
 
-	if (list_empty(&wans))
-		return -ENOENT;
+    list_for_each_entry(w, &wans, list) {
+        // Skip interfaces that are down
+        if (!w->is_up)
+            continue;
 
-	list_for_each_entry(w, &wans, list) {
-		if (w->family != family)
-			continue;
+        if (family == AF_INET) {
+            struct in_addr *in_addr = (struct in_addr *)addr;
+            if (w->ipv4_addr.s_addr == in_addr->s_addr)
+                return w->wan_idx;
+        } else if (family == AF_INET6) {
+            if (!memcmp(&w->ipv6_addr, addr, sizeof(struct in6_addr)))
+                return w->wan_idx;
+        }
+    }
 
-		a = addr->s6_addr32;
-		b = w->addr.in6.s6_addr32;
-
-		if (memcmp(a, b, sizeof(*a)))
-			continue;
-
-		return w->wan_idx;
-	}
-
-	return -ENOENT;
+    return -ENOENT;
 }
 
 const char *get_wan_name(int index)
 {
-	if (index >= num_wans) {
-		error_printf("Error - Bad wan index - %d\n", index);
-		assert(0);
-		return "Error getting wan!";
-	}
+    if (index >= num_wans) {
+        error_printf("Error - Bad wan index - %d\n", index);
+        assert(0);
+        return "Error getting wan!";
+    }
 
-	return wan_indx_arr[index];
+    return wan_indx_arr[index];
 }
 
 int wan_read_config(void)
 {
-	char path[50]="nlbwmon.@nlbwmon[0].wan_interface";
-	struct uci_ptr ptr;
-	struct uci_context *c = uci_alloc_context();
+    char path[50]="nlbwmon.@nlbwmon[0].wan_interface";
+    struct uci_ptr ptr;
+    struct uci_context *c = uci_alloc_context();
 
-	if (!c) return -1;
+    if (!c) return -1;
 
-	if (uci_lookup_ptr(c, &ptr, path, true) != UCI_OK) {
-		uci_free_context(c);
-		return -1;
-	}
+    if (uci_lookup_ptr(c, &ptr, path, true) != UCI_OK) {
+        uci_free_context(c);
+        return -1;
+    }
 
-	if (ptr.o->type != UCI_TYPE_LIST) {
-		uci_free_context(c);
-		return -1;
-	}
+    if (ptr.o->type != UCI_TYPE_LIST) {
+        uci_free_context(c);
+        return -1;
+    }
 
-	struct uci_element *l;
-	const char *p;
+    struct uci_element *l;
+    const char *p;
 
-	uci_foreach_element(&ptr.o->v.list, l) {
-		p = l->name;
-		if (!p) continue;
+    uci_foreach_element(&ptr.o->v.list, l) {
+        p = l->name;
+        if (!p) continue;
 
-		if (num_wans == MAX_WANS) {
-			uci_free_context(c);
-			return -1;
-		}
+        if (num_wans == MAX_WANS) {
+            uci_free_context(c);
+            return -1;
+        }
 
-		wan_indx_arr[num_wans++] = p;
-	}
+        wan_indx_arr[num_wans++] = p;
+    }
 
-	uci_free_context(c);
-	
-	return num_wans;
+    uci_free_context(c);
+    
+    if (wan_monitor_init() < 0) {
+        error_printf("Failed to initialize WAN monitor\n");
+        return -1;
+    }
+    
+    return num_wans;
 }
-

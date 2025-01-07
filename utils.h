@@ -39,6 +39,8 @@
 int rmkdir(const char *path);
 
 char * format_macaddr(struct ether_addr *mac);
-char * format_ipaddr(int family, void *addr, int is_host_order);
+char * format_ipaddr(int family, const void *addr, int is_host_order);
+
+int tp_diff(struct timespec *start, struct timespec *end);
 
 #endif /* __UTILS_H__ */

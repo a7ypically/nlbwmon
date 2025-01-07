@@ -33,6 +33,7 @@
 #include "nlbwmon.h"
 #include "utils.h"
 #include "mmap_cache.h"
+#include "database.h"
 #include "hosts.h"
 
 #define HOSTS_RECORD_CACHE_SIZE 1000
@@ -157,6 +158,129 @@ static int hosts_mmap_persist(const char *path, uint32_t timestamp)
 static void hosts_grace_timeout_cb(struct uloop_timeout *tm)
 {
 	HostsNewGracePeriod = 0;
+}
+
+struct hosts_stat *hosts_get_all(size_t *count) {
+    size_t num_hosts = hosts_record_avl.count;
+    struct hosts_stat *stats = NULL;
+
+    if (num_hosts == 0) {
+        *count = 0;
+        return NULL;
+    }
+
+    stats = calloc(num_hosts, sizeof(struct hosts_stat));
+    if (!stats) {
+        *count = 0;
+        return NULL;
+    }
+
+    struct hosts_record_entry *ptr;
+    size_t i = 0;
+
+    // Initialize stats array with hosts records
+    avl_for_each_element(&hosts_record_avl, ptr, node) {
+        stats[i].record = ptr;
+        i++;
+    }
+
+    // Collect IPs and connection counts from database records
+    struct record *rec = NULL;
+    while ((rec = database_next(gdbh, rec)) != NULL) {
+        for (i = 0; i < num_hosts; i++) {
+            if (memcmp(&stats[i].record->mac_addr, &rec->src_mac.ea, sizeof(struct ether_addr)) == 0) {
+                stats[i].conn_count += be64toh(rec->count);
+
+                // Check if IP already exists and find empty slot
+                bool ip_exists = false;
+                size_t j;
+                for (j = 0; j < NEIGH_MAX_STAT_IPS; j++) {
+                    if (stats[i].ip[j].family == 0) {
+                        break;
+                    }
+                    if (stats[i].ip[j].family == rec->family &&
+                        memcmp(&stats[i].ip[j].addr, &rec->src_addr, sizeof(rec->src_addr)) == 0) {
+                        ip_exists = true;
+                        break;
+                    }
+                }
+
+                // Add IP if not exists and there's space
+                if (!ip_exists && j < NEIGH_MAX_STAT_IPS) {
+                    stats[i].ip[j].family = rec->family;
+                    memcpy(&stats[i].ip[j].addr, &rec->src_addr, sizeof(rec->src_addr));
+                }
+                break;
+            }
+        }
+    }
+
+    *count = num_hosts;
+    return stats;
+}
+
+int hosts_clean() {
+    size_t num_removed = 0;
+    
+    // Iterate backwards through the mmap cache
+    for (int i = hosts_record_mmap_db_len - 1; i >= 0; i--) {
+        struct hosts_record_entry *entry = hosts_record_db + i;
+        
+        // Skip unused entries
+        if (!entry->node.key)
+            continue;
+
+        // Check if entry has no name
+        if (entry->hostname[0] == '\0') {
+            // Count connections for this MAC
+            uint64_t conn_count = 0;
+            struct record *rec = NULL;
+            while ((rec = database_next(gdbh, rec)) != NULL) {
+                if (memcmp(&entry->mac_addr, &rec->src_mac.ea, sizeof(struct ether_addr)) == 0) {
+                    conn_count += be64toh(rec->count);
+                    if (conn_count > 0) break; // Early exit if we find any connections
+                }
+            }
+
+            // If no connections, remove the entry
+            if (conn_count == 0) {
+                num_removed++;
+                
+                // Compact the cache by moving remaining entries
+                if (i < hosts_record_mmap_db_len - 1) {
+                    memmove(entry, entry + 1, 
+                        (hosts_record_mmap_db_len - i - 1) * sizeof(*entry));
+                }
+                
+                // Clear last entry and update counters
+                memset(&hosts_record_db[hosts_record_mmap_db_len - 1], 0, sizeof(*entry));
+                hosts_record_mmap_db_len--;
+                if (*hosts_record_mmap_next_entry > 0) {
+                    (*hosts_record_mmap_next_entry)--;
+                }
+            }
+        }
+    }
+    
+    if (num_removed > 0) {
+        // Rebuild AVL tree
+        avl_init(&hosts_record_avl, avl_cmp_hosts_record, false, NULL);
+        for (int i = 0; i < hosts_record_mmap_db_len; i++) {
+            struct hosts_record_entry *entry = hosts_record_db + i;
+            if (!entry->node.key)
+                continue;
+            entry->node.key = &entry->mac_addr;
+            if (avl_insert(&hosts_record_avl, &entry->node)) {
+                error_printf("Error adding entry to AVL tree\n");
+                entry->node.key = NULL;
+            }
+        }
+
+        // Save changes to mmap cache
+        MMAP_CACHE_SAVE(hosts_record, HOSTS_RECORD_CACHE_SIZE, NULL, 0);
+    }
+    
+    return num_removed;
 }
 
 int init_hosts(const char *db_path, uint32_t timestamp)

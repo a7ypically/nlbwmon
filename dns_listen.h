@@ -1,6 +1,7 @@
 /*
   ISC License
 
+
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
   copyright notice and this permission notice appear in all copies.
@@ -13,29 +14,9 @@
   OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
   PERFORMANCE OF THIS SOFTWARE.
 */
+#ifndef __DNS_LISTEN_H__
+#define __DNS_LISTEN_H__
 
-#ifndef __WAN_H__
-#define __WAN_H__
+int dns_listen_run(const char *port);
 
-#include <stdint.h>
-#include <netinet/in.h>
-#include <linux/if.h>
-
-#include <libubox/list.h>
-
-
-struct wan {
-    struct list_head list;
-    uint8_t wan_idx;
-    uint8_t is_up;
-    char ifname[IFNAMSIZ];
-    struct in_addr ipv4_addr;
-    struct in6_addr ipv6_addr;
-};
-
-int add_wan(const char *name, const char *ifname);
-int match_wan(int family, struct in6_addr *addr);
-const char *get_wan_name(int index);
-int wan_read_config(void);
-
-#endif /* __WAN_H__ */
+#endif

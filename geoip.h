@@ -40,5 +40,6 @@ struct geoip_entry {
 
 int geoip_lookup(struct record *rec);
 int init_geoip_mmap(const char *db_path);
+int geoip_is_bogon(const char *country);
 
 #endif

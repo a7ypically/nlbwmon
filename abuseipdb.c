@@ -131,7 +131,7 @@ int init_abuseipdb(void)
 	if (!token) return -1;
 
 	AbuseipdbToken = strdup(token);
-	abuseipdb_https_ctx = https_init(&abuseipdb_https_cbs, "api.abuseipdb.com", 443);
+	abuseipdb_https_ctx = https_init(&abuseipdb_https_cbs, "api.abuseipdb.com", 443, 10);
 	https_set_retries(abuseipdb_https_ctx, 0, 10);
 
 	return 0;

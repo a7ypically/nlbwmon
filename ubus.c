@@ -48,6 +48,8 @@ static int receive_request(struct ubus_context *ctx, struct ubus_object *obj,
   if (!strcmp(method, "dns_result")) {
     char *r_name = NULL;
     char *r_addr = NULL;
+    char *c_addr = NULL;
+    uint32_t ttl = -1;
 
     int rem = blobmsg_data_len(msg);
     struct blob_attr *msg_data = blobmsg_data(msg);
@@ -55,7 +57,7 @@ static int receive_request(struct ubus_context *ctx, struct ubus_object *obj,
       if (!blobmsg_check_attr(pos, false))
         continue;
 
-      if (blob_id(pos) != BLOBMSG_TYPE_STRING) continue;
+      //if (blob_id(pos) != BLOBMSG_TYPE_STRING) continue;
 
       name = blobmsg_name(pos);
 
@@ -64,8 +66,18 @@ static int receive_request(struct ubus_context *ctx, struct ubus_object *obj,
         continue;
       }
 
+      if (!strcmp(name, "ttl")) {
+        ttl = blobmsg_get_u32(pos);
+        continue;
+      }
+
       if (!strcmp(name, "address")) {
         r_addr = (char *)blobmsg_data(pos);
+        continue;
+      }
+
+      if (!strcmp(name, "client_addr")) {
+        c_addr = (char *)blobmsg_data(pos);
         continue;
       }
     }
@@ -75,7 +87,7 @@ static int receive_request(struct ubus_context *ctx, struct ubus_object *obj,
       return 0;
     }
 
-    dns_update(r_name, r_addr);
+    dns_update(r_name, ttl, r_addr, c_addr);
 
   } else if (!strcmp(method, "dhcp.ack") || !strcmp(method, "dhcp.release")) {
 
@@ -194,7 +206,7 @@ void init_ubus(void)
     error_printf("Error while registering for event: %s\n", ubus_strerror(ret));
     exit(1);
   }
-  ret = ubus_lookup_id(ubus, "adguard.dns", &id);
+  ret = ubus_lookup_id(ubus, "dnsmasq.dns", &id);
   if (ret) {
     error_printf("Error while registering for event: %s\n", ubus_strerror(ret));
     exit(1);

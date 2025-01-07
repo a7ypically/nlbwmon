@@ -75,6 +75,9 @@ const char *lookup_asn(uint32_t asn)
 	if (!ptr)
 		return NULL;
 
+	if (ptr->org[strlen(ptr->org)-1] == '\\') {
+		ptr->org[strlen(ptr->org)-1] = 0;
+	}
 	return ptr->org;
 }
 

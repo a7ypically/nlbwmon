@@ -56,6 +56,7 @@
 #include "geoip.h"
 #include "asn.h"
 #include "dns.h"
+#include "dns_listen.h"
 #include "hosts.h"
 #include "notify.h"
 #include "abuseipdb.h"
@@ -229,8 +230,9 @@ server_main(int argc, char **argv)
 	uint32_t timestamp;
 	int optchr, err;
 	char *e;
+	int dns_listen_port = -1;
 
-	while ((optchr = getopt(argc, argv, "b:i:r:s:w:o:p:G:I:L:PZ")) > -1) {
+	while ((optchr = getopt(argc, argv, "d:b:i:r:s:w:o:p:G:I:L:PZ")) > -1) {
 		switch (optchr) {
 		case 'b':
 			opt.netlink_buffer_size = (int)strtol(optarg, &e, 0);
@@ -239,6 +241,10 @@ server_main(int argc, char **argv)
 				        optarg);
 				return 1;
 			}
+			break;
+
+		case 'd':
+			dns_listen_port = atoi(optarg);
 			break;
 
 		case 'i':
@@ -412,6 +418,8 @@ server_main(int argc, char **argv)
 	uloop_timeout_set(&refresh_tm, opt.refresh_interval * 1000);
 
 	init_ubus();
+	if (dns_listen_port > 0)
+		dns_listen_run(dns_listen_port);
 
 	err = nfnetlink_dump(true);
 

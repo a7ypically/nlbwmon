@@ -21,6 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
+#include <arpa/inet.h>
 
 #include <libubox/usock.h>
 #include <libubox/uloop.h>
@@ -49,6 +50,8 @@
 #define TG_MSG_ID_TYPE_INCOMING 2
 #define TG_MSG_ID_TYPE_UPLOAD   3
 #define TG_MSG_ID_TYPE_CLIENT_INFO   4
+
+#define TG_MSG_ID_FLAG_OUTGOING_NO_DNS 0x1
 
 #define TG_MSG_ID_FLAG_CLIENT_INFO_SET_NAME 0x1
 #define TG_MSG_ID_FLAG_CLIENT_INFO_NEW      0x2
@@ -96,12 +99,14 @@ struct record_key {
 	char country[2];
 	int32_t lonlat[2];
 	uint16_t asn;
+	uint16_t topl_domain;
 };
 
 struct tg_msg_entry {
 	int message_id;
 	uint8_t type;
 	uint8_t flags;
+	uint8_t notify_flag;
 	struct record_key rec_key;
 	struct in6_addr ext_addr;
 	struct avl_node node;
@@ -198,7 +203,7 @@ static void tg_api_reply_callback(void)
 static void tg_api_send_msg(char *msg)
 {
 	char url[128];
-	char data[1500];
+	char data[4096];
 
 	assert(tg_send_msg_state == TG_SEND_STATE_IDLE);
 	assert(ChatID && TGBotToken);
@@ -264,19 +269,28 @@ static void tg_format_inline_keys(struct tg_msg_entry *msg, char *msg_str, int m
 
 	if (TGCallbackState[0] == 1) {
 		if (TGCallbackState[1] == 0) {
+			if (msg->rec_key.topl_domain) {
+				snprintf(str, sizeof(str), "%s", dns_get_topl(msg->rec_key.topl_domain));
+				tg_add_inline_key(&keys, str, "2");
+				tg_add_inline_key(&keys, "\n", "");
+			}
 			snprintf(str, sizeof(str), "%s", lookup_asn(msg->rec_key.asn));
 			tg_add_inline_key(&keys, str, "1");
 			tg_add_inline_key(&keys, "\n", "");
-			tg_add_inline_key(&keys, "any org", "9");
+			tg_add_inline_key(&keys, "any org or host", "9");
 			tg_add_inline_key(&keys, "\n", "");
 			tg_add_inline_key(&keys, "Cancel", "cancel");
-			snprintf(msg_str, msg_size, "\n\n%c%c%c%c <b>Mute notifications for %s org...</b>", 0Xf0, 0X9f, 0X91, 0X89, msg->rec_key.type & RECORD_TYPE_WAN_IN ? "inbound connections from": "outbound connections to");
+			snprintf(msg_str, msg_size, "\n\n%c%c%c%c <b>Mute notifications for %s org or domain...</b>", 0Xf0, 0X9f, 0X91, 0X89, msg->rec_key.type & RECORD_TYPE_WAN_IN ? "inbound connections from": "outbound connections to");
 			return;
 		}
 
+		const char *host_or_org = "any host or org";
+		if (TGCallbackState[1] == 1) host_or_org = lookup_asn(msg->rec_key.asn);
+		else if (TGCallbackState[1] == 2) host_or_org = dns_get_topl(msg->rec_key.topl_domain);
+
 		len = snprintf(msg_str, msg_size, "\n\n%c%c%c%c <b>Mute notifications for %s %s ", 0Xf0, 0X9f, 0X91, 0X89,
 				msg->rec_key.type & RECORD_TYPE_WAN_IN ? "inbound connections from": "outbound connections to",
-				TGCallbackState[1] == 1 ? lookup_asn(msg->rec_key.asn) : "any org");
+				host_or_org);
 		msg_size -= len;
 		msg_str += len;
 		assert(msg_size > 0);
@@ -307,6 +321,11 @@ static void tg_format_inline_keys(struct tg_msg_entry *msg, char *msg_str, int m
 			snprintf(str, sizeof(str), "%s", get_protocol_name(msg->rec_key.proto, ntohs(msg->rec_key.dst_port)));
 			tg_add_inline_key(&keys, str, "1");
 			tg_add_inline_key(&keys, "\n", "");
+			if (msg->rec_key.proto == 17) {
+				snprintf(str, sizeof(str), "%s any port", get_protocol_name(msg->rec_key.proto, 0));
+				tg_add_inline_key(&keys, str, "2");
+			}
+			tg_add_inline_key(&keys, "\n", "");
 			tg_add_inline_key(&keys, "any protocol", "9");
 			tg_add_inline_key(&keys, "\n", "");
 			tg_add_inline_key(&keys, "Cancel", "cancel");
@@ -315,8 +334,16 @@ static void tg_format_inline_keys(struct tg_msg_entry *msg, char *msg_str, int m
 			return;
 		}
 
+		if (TGCallbackState[3] > 9) {
+			if (TGCallbackState[3] == 1) {
+				snprintf(str, sizeof(str), "%s", get_protocol_name(msg->rec_key.proto, ntohs(msg->rec_key.dst_port)));
+			} else {
+				snprintf(str, sizeof(str), "%s any port", get_protocol_name(msg->rec_key.proto, 0));
+			}
+		}
+
 		len = snprintf(msg_str, msg_size, "using %s ",
-				TGCallbackState[3] == 1 ? get_protocol_name(msg->rec_key.proto, ntohs(msg->rec_key.dst_port)) : "any protocol");
+				TGCallbackState[3] != 9 ? str: "any protocol");
 				
 		msg_size -= len;
 		msg_str += len;
@@ -387,9 +414,9 @@ static void tg_format_inline_keys(struct tg_msg_entry *msg, char *msg_str, int m
 	}
 }
 
-static int tg_check_muted(struct record *r, char *msg, int *len, int size)
+static int tg_check_muted(struct record *r, uint8_t notify_flag, char *msg, int *len, int size)
 {
-	if (notify_is_muted(r, NULL)) {
+	if (notify_is_muted(r, notify_flag, NULL)) {
 		*len += snprintf(msg, size, "%c%c%c%c <b>MUTED</b>\n",0xf0, 0X9f, 0x94, 0x95);
 		return 1;
 	}
@@ -446,7 +473,7 @@ static void tg_format_incoming(struct record *r, struct tg_msg_entry *tg_msg)
 	char *ext_str = strdup(format_ipaddr(r->family, &r->last_ext_addr, 1));
 	int len = 0;
 
-	tg_check_muted(r, msg, &len, sizeof(msg));
+	tg_check_muted(r, tg_msg->notify_flag, msg, &len, sizeof(msg));
 
 	len += snprintf(msg+len, sizeof(msg)-len, "%c%c%c%c <b>INBOUND</b> connection from %s\n", 0xf0, 0x9f, 0x94, 0xbd, tg_get_country_str(r->country));
 
@@ -493,9 +520,13 @@ static void tg_format_outgoing(struct record *r, struct tg_msg_entry *tg_msg)
 
 	tg_get_host_names(r, domains, sizeof(domains));
 
-	tg_check_muted(r, msg, &len, sizeof(msg));
+	tg_check_muted(r, tg_msg->notify_flag, msg, &len, sizeof(msg));
 
-	len += snprintf(msg+len, sizeof(msg)-len, "%c%c%c%c <b>OUTBOUND</b> connection to %s\n", 0xf0, 0x9f, 0x94, 0xba, tg_get_country_str(r->country));
+	if (tg_msg->flags & TG_MSG_ID_FLAG_OUTGOING_NO_DNS) {
+		len += snprintf(msg+len, sizeof(msg)-len, "%c%c%c%c <b>No DNS</b> for outbound connection to %s\n", 0xf0, 0x9f, 0x8c, 0x90, tg_get_country_str(r->country));
+	} else {
+		len += snprintf(msg+len, sizeof(msg)-len, "%c%c%c%c <b>OUTBOUND</b> connection to %s\n", 0xf0, 0x9f, 0x94, 0xba, tg_get_country_str(r->country));
+	}
 
 	char info[128] = {};
 	if (r && (tg_msg->message_id != -1)) {
@@ -537,7 +568,7 @@ static void tg_format_upload(struct record *r, struct tg_msg_entry *tg_msg)
 	int len = 0;
 
 	tg_get_host_names(r, domains, sizeof(domains));
-	tg_check_muted(r, msg, &len, sizeof(msg));
+	tg_check_muted(r, tg_msg->notify_flag, msg, &len, sizeof(msg));
 
 	char emoji[] = {0xf0, 0x9f, 0x94, 0xba,
 		0xf0, 0x9f, 0x94, 0xba,
@@ -587,7 +618,11 @@ static void tg_format_client_info(struct record *r, struct tg_msg_entry *tg_msg)
 	char new_emoji[] = {0Xf0, 0X9f, 0x86, 0x95, 0};
 
 	if (tg_msg->flags & TG_MSG_ID_FLAG_CLIENT_INFO_NEW) {
-		len = snprintf(msg, sizeof(msg), "%s <b>NEW CLIENT</b>\n", new_emoji);
+		if (tg_msg->notify_flag == 1) {
+			len = snprintf(msg, sizeof(msg), "%s <b>HOST INFO</b>\n", host_emoji);
+		} else {
+			len = snprintf(msg, sizeof(msg), "%s <b>NEW CLIENT</b>\n", new_emoji);
+		}
 	}
 
 	if (client_name) {
@@ -866,7 +901,7 @@ static struct https_cbs tg_send_https_cbs = {
 	.error = tg_send_on_https_error,
 };
 	
-static void tg_send_msg_with_id(uint8_t type, uint8_t flags, struct record *r, struct tg_msg_entry *msg)
+static void tg_send_msg_with_id(uint8_t type, uint8_t flags, struct record *r, struct tg_msg_entry *msg, uint8_t notify_flag)
 {
 	struct tg_msg_entry *ptr;
 
@@ -900,6 +935,7 @@ static void tg_send_msg_with_id(uint8_t type, uint8_t flags, struct record *r, s
 
 	ptr->type = type;
 	ptr->flags = flags;
+	ptr->notify_flag = notify_flag;
 
 	if (r) {
 		ptr->ext_addr = r->last_ext_addr;
@@ -916,25 +952,29 @@ static void tg_send_msg_with_id(uint8_t type, uint8_t flags, struct record *r, s
 	}
 }
 
-void tg_notify_outgoing(struct record *r)
+void tg_notify_outgoing(struct record *r, uint8_t notify_flag)
 {
-	tg_send_msg_with_id(TG_MSG_ID_TYPE_OUTGOING, 0, r, NULL);
+	tg_send_msg_with_id(TG_MSG_ID_TYPE_OUTGOING, 0, r, NULL, notify_flag);
 }
 
-void tg_notify_incoming(struct record *r)
+void tg_notify_incoming(struct record *r, uint8_t notify_flag)
 {
-	tg_send_msg_with_id(TG_MSG_ID_TYPE_INCOMING, 0, r, NULL);
+	tg_send_msg_with_id(TG_MSG_ID_TYPE_INCOMING, 0, r, NULL, notify_flag);
 }
 
-void tg_notify_upload(struct record *r)
+void tg_notify_upload(struct record *r, uint8_t notify_flag)
 {
-	tg_send_msg_with_id(TG_MSG_ID_TYPE_UPLOAD, 0, r, NULL);
+	tg_send_msg_with_id(TG_MSG_ID_TYPE_UPLOAD, 0, r, NULL, notify_flag);
 }
 
 void tg_notify_new_client(struct ether_addr *mac) {
 	struct tg_msg_entry msg = {};
 	msg.rec_key.src_mac.ea = *mac;
-	tg_send_msg_with_id(TG_MSG_ID_TYPE_CLIENT_INFO, TG_MSG_ID_FLAG_CLIENT_INFO_NEW, NULL, &msg);
+	tg_send_msg_with_id(TG_MSG_ID_TYPE_CLIENT_INFO, TG_MSG_ID_FLAG_CLIENT_INFO_NEW, NULL, &msg, 0);
+}
+
+void tg_notify_no_dns(struct record *r, uint8_t notify_flag) {
+	tg_send_msg_with_id(TG_MSG_ID_TYPE_OUTGOING, TG_MSG_ID_FLAG_OUTGOING_NO_DNS, r, NULL, notify_flag);
 }
 
 const char *tg_get_token(void)
@@ -1027,11 +1067,16 @@ static void tg_handle_state_callback(struct tg_msg_entry *msg, char *callback_da
 		}
 
 		struct notify_params params = {};
+		params.notify_flag = msg->notify_flag;
 		if (TGCallbackState[1] == 1) params.asn = msg->rec_key.asn;
+		else if (TGCallbackState[1] == 2) params.topl_domain = msg->rec_key.topl_domain;
 		if (TGCallbackState[2] == 1) memcpy(params.country, msg->rec_key.country, sizeof(params.country));
 		if (TGCallbackState[3] == 1) {
 			params.proto = msg->rec_key.proto;
 			params.dst_port = msg->rec_key.dst_port;
+		} else if (TGCallbackState[3] == 2) {
+			params.proto = msg->rec_key.proto;
+			params.dst_port = 0;
 		}
 
 		if (TGCallbackState[4] == 1) {
@@ -1064,7 +1109,7 @@ static void tg_handle_state_callback(struct tg_msg_entry *msg, char *callback_da
 				if (m->message_id == -1) continue;
 				struct record *r = database_find(&m->rec_key, sizeof(m->rec_key));
 				if (!r) continue;
-				if (notify_is_muted(r, &params)) {
+				if (notify_is_muted(r, m->notify_flag, &params)) {
 					tg_msg_refresh(m->message_id);
 					tg_send_next_msg();
 				}
@@ -1164,7 +1209,7 @@ void tg_on_poll_callback(int chat_id, int message_id, char *callback_query_id, c
 		CallbackMsgReply = NULL;
 		tg_send_next_msg();
 
-		tg_send_msg_with_id(TG_MSG_ID_TYPE_CLIENT_INFO, TG_MSG_ID_FLAG_CLIENT_INFO_SET_NAME, NULL, msg);
+		tg_send_msg_with_id(TG_MSG_ID_TYPE_CLIENT_INFO, TG_MSG_ID_FLAG_CLIENT_INFO_SET_NAME, NULL, msg, 0);
 		return;
 	}
 
@@ -1220,23 +1265,212 @@ void tg_on_poll_callback(int chat_id, int message_id, char *callback_query_id, c
 	tg_send_next_msg();
 }
 
+// Helper struct for sorting hosts
+struct host_sort_entry {
+    struct hosts_stat *stat;
+    size_t index;
+};
+
+static int compare_hosts(const void *a, const void *b) {
+    const struct host_sort_entry *ha = a;
+    const struct host_sort_entry *hb = b;
+    // Sort by connection count, highest first
+    if (ha->stat[ha->index].conn_count > hb->stat[hb->index].conn_count) return -1;
+    if (ha->stat[ha->index].conn_count < hb->stat[hb->index].conn_count) return 1;
+    return 0;
+}
+
+static int format_host_entry(char *buf, size_t size, const struct hosts_stat *stat) {
+    int len = 0;
+    
+    // Format hostname if exists, otherwise just MAC
+    if (stat->record->hostname[0]) {
+        len += snprintf(buf + len, size - len, "<b>%s</b> (%s)\n", 
+            stat->record->hostname, format_macaddr(&stat->record->mac_addr));
+    } else {
+        len += snprintf(buf + len, size - len, "<b>%s</b>\n", 
+            format_macaddr(&stat->record->mac_addr));
+    }
+    
+    // Add connection count
+    len += snprintf(buf + len, size - len, "Connections: %lu\n", stat->conn_count);
+    
+    // Add IPs
+    len += snprintf(buf + len, size - len, "IPs:\n");
+    for (int i = 0; i < NEIGH_MAX_STAT_IPS && stat->ip[i].family; i++) {
+        len += snprintf(buf + len, size - len, "- %s\n", 
+            format_ipaddr(stat->ip[i].family, &stat->ip[i].addr, 1));
+    }
+    
+    len += snprintf(buf + len, size - len, "\n");
+    return len;
+}
+
+static void send_hosts_list(void) {
+    size_t count;
+    struct hosts_stat *stats = hosts_get_all(&count);
+    if (!stats || count == 0) {
+        tg_send_msg("No hosts found.");
+        return;
+    }
+
+    // Create sorted array of indices
+    struct host_sort_entry *sorted = calloc(count, sizeof(struct host_sort_entry));
+    if (!sorted) {
+        free(stats);
+        tg_send_msg("Memory allocation error");
+        return;
+    }
+
+    // Initialize sorting array
+    for (size_t i = 0; i < count; i++) {
+        sorted[i].stat = stats;
+        sorted[i].index = i;
+    }
+
+    // Sort by connection count
+    qsort(sorted, count, sizeof(struct host_sort_entry), compare_hosts);
+
+    // Send messages in chunks
+    char msg[1024];
+    int msg_len = 0;
+    int hosts_in_msg = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        // Skip hosts without hostname
+        if (!stats[sorted[i].index].record->hostname[0]) continue;
+
+        // Format this host entry into a temporary buffer
+        char host_buf[256];
+        int host_len = format_host_entry(host_buf, sizeof(host_buf), &stats[sorted[i].index]);
+
+        // If this host entry would overflow the message, send current message and start new one
+        if (msg_len + host_len >= sizeof(msg)) {
+            if (msg_len > 0) {
+                tg_send_msg(msg);
+                msg_len = 0;
+                hosts_in_msg = 0;
+            }
+        }
+
+        // Add host entry to message
+        strcpy(msg + msg_len, host_buf);
+        msg_len += host_len;
+        hosts_in_msg++;
+    }
+
+    // Send any remaining hosts
+    if (hosts_in_msg > 0) {
+        tg_send_msg(msg);
+    }
+
+    // Now send unknown hosts in a separate message if any exist
+    msg_len = 0;
+    hosts_in_msg = 0;
+    for (size_t i = 0; i < count; i++) {
+        // Only process hosts without hostname
+        if (stats[sorted[i].index].record->hostname[0]) continue;
+
+        // Format this host entry into a temporary buffer
+        char host_buf[256];
+        int host_len = format_host_entry(host_buf, sizeof(host_buf), &stats[sorted[i].index]);
+
+        // If this host entry would overflow the message, send current message and start new one
+        if (msg_len + host_len >= sizeof(msg)) {
+            if (msg_len > 0) {
+                tg_send_msg(msg);
+                msg_len = 0;
+                hosts_in_msg = 0;
+            }
+        }
+
+        if (hosts_in_msg == 0) {
+            msg_len = snprintf(msg, sizeof(msg), "Unknown hosts:\n\n");
+        }
+
+        strcpy(msg + msg_len, host_buf);
+        msg_len += host_len;
+        hosts_in_msg++;
+    }
+
+    // Send any remaining unknown hosts
+    if (hosts_in_msg > 0) {
+        tg_send_msg(msg);
+    }
+
+    free(sorted);
+    free(stats);
+}
+
 void tg_on_poll_text(int chat_id, int message_id, char *text)
 {
-	if (!ChatID) {
-		ChatID = chat_id;
+    if (!ChatID) {
+        ChatID = chat_id;
 		char chat_id_str[100];
 		snprintf(chat_id_str, sizeof(chat_id_str), "%d", chat_id);
 		if (config_set("tg_chat_id", chat_id_str) != 0) {
 			error_printf("Error saving chat id in config file.\n");
 		}
 		tg_api_send_msg("Hi there! I'm ready and will send notifications to this channel.");
-	} else if (chat_id != ChatID) {
-		tg_api_send_msg("Received a message from a different TG ID. Ignoring.");
-		return;
-	}
+    } else if (chat_id != ChatID) {
+        tg_api_send_msg("Received a message from a different TG ID. Ignoring.");
+        return;
+    }
 
-	if (tg_send_msg_wait_input) {
-		uloop_timeout_cancel(&wait_input_tm);
+    if (!strcmp(text, "/hosts")) {
+        send_hosts_list();
+        return;
+    }
+
+	if (!strcmp(text, "/hosts clean")) {
+        hosts_clean();
+		int num_removed = hosts_clean();
+		char msg[64];
+		snprintf(msg, sizeof(msg), "%d hosts removed from database.", num_removed);
+		tg_send_msg(msg);
+        return;
+    }
+
+    if (strncmp(text, "/host ", 6) == 0) {
+        const char *ip = text + 6;
+        struct in_addr ip4_addr;
+        struct in6_addr ip6_addr;
+        int family;
+        
+        // Try to parse as IPv4 first
+        if (inet_pton(AF_INET, ip, &ip4_addr) == 1) {
+            ip4_addr.s_addr = be32toh(ip4_addr.s_addr);
+            family = AF_INET;
+        } 
+        // Then try IPv6
+        else if (inet_pton(AF_INET6, ip, &ip6_addr) == 1) {
+            family = AF_INET6;
+        }
+        else {
+            tg_send_msg("Invalid IP address format");
+            return;
+        }
+        
+        // Try to find MAC address for this IP
+        struct record *rec = NULL;
+        while ((rec = database_next(gdbh, rec)) != NULL) {
+            if (rec->family == family) {
+                if ((family == AF_INET && memcmp(&rec->src_addr.in, &ip4_addr, sizeof(ip4_addr)) == 0) ||
+                    (family == AF_INET6 && memcmp(&rec->src_addr.in6, &ip6_addr, sizeof(ip6_addr)) == 0)) {
+                    struct tg_msg_entry msg = {};
+                    msg.rec_key.src_mac.ea = rec->src_mac.ea;
+                    tg_send_msg_with_id(TG_MSG_ID_TYPE_CLIENT_INFO, TG_MSG_ID_FLAG_CLIENT_INFO_NEW, NULL, &msg, 1);
+                    return;
+                }
+            }
+        }
+        
+        tg_send_msg("Could not find a device with this IP address in current database.");
+        return;
+    }
+
+    if (tg_send_msg_wait_input) {
+        uloop_timeout_cancel(&wait_input_tm);
 		tg_send_msg_wait_input = 0;
 		int res = hosts_update_by_addr(text, &TGNameReqAddr, TYPE_USER_PROVIDED);
 
@@ -1260,7 +1494,7 @@ void tg_on_poll_text(int chat_id, int message_id, char *text)
 		}
 		TGNameReqMsgID = -1;
 		memset(&TGNameReqAddr, 0, sizeof(TGNameReqAddr));
-	}
+    }
 }
 
 void tg_on_poll_pinned(int chat_id, int message_id)
@@ -1280,7 +1514,7 @@ void tg_on_poll_pinned(int chat_id, int message_id)
 
 __attribute__((constructor)) static void tg_send_init(void)
 {
-        tg_send_https_ctx = https_init(&tg_send_https_cbs, "api.telegram.org", 443);
+        tg_send_https_ctx = https_init(&tg_send_https_cbs, "api.telegram.org", 443, 10);
 }
 
 static int

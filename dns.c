@@ -28,18 +28,21 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <libubox/avl.h>
 
 #include "utils.h"
 #include "database.h"
 #include "mmap_cache.h"
 #include "dns.h"
 
-#define DNS_IP_CACHE_SIZE 1000
+// DNS resolve cache by IP and client IP
+#define DNS_IP_CACHE_SIZE 10000
 DEFINE_MMAP_CACHE(dns_ip_cache);
 
 #define DNS_RECORD_CACHE_SIZE 50000
 DEFINE_MMAP_CACHE(dns_record);
+
+#define DNS_TOPL_RECORD_CACHE_SIZE 5000
+DEFINE_MMAP_CACHE(dns_topl_record);
 
 static uint32_t DnsRecordNextID = 1;
 
@@ -49,11 +52,15 @@ static char *format_dns_ip_key(const void *ptr) {
 	return format_ipaddr(key->data.family, &key->data.addr, 1);
 }
 
-int dns_update(const char *name, const char *addr)
+int dns_update(const char *name, uint32_t ttl, const char *addr, const char *c_addr)
 {
 	struct dns_record_entry *record_entry, *tmp;
+	struct timespec tp;
+	if (clock_gettime(CLOCK_MONOTONIC_COARSE, &tp)) {
+		error_printf("Can't get time - %s\n", strerror(errno));
+	}
 
-	debug_printf("dns_update - %s %s\n", name, addr);
+	debug_printf("%ld.%ld dns_update - %s %s client:%s\n", tp.tv_sec, tp.tv_nsec, name, addr, c_addr);
 
 	int len = strlen(name);
 	char c_name[MAX_DNS_LEN+1];
@@ -62,6 +69,7 @@ int dns_update(const char *name, const char *addr)
 		c_name[0] = '.';
 		c_name[1] = '.';
 		strcpy(c_name+2, name + len - MAX_DNS_LEN + 2);
+		len = MAX_DNS_LEN;
 	} else {
 		strcpy(c_name, name);
 	}
@@ -74,6 +82,29 @@ int dns_update(const char *name, const char *addr)
 		MMAP_CACHE_GET_NEXT(record_entry, dns_record, DNS_RECORD_CACHE_SIZE, NULL);
 		strcpy(record_entry->hostname, c_name);
 		record_entry->id = DnsRecordNextID++;
+		char *topl_domain = strrchr(c_name, '.');
+		if (topl_domain) {
+			while (topl_domain > c_name) {
+				topl_domain--;
+				if ((c_name + len - topl_domain > 7) && (*topl_domain == '.')) {
+					topl_domain++;
+					break;
+				}
+			}
+			struct dns_topl_record_entry *record_topl_entry, *tmp;
+			record_topl_entry = avl_find_element(&dns_topl_record_avl, topl_domain, tmp, node);
+			if (!record_topl_entry) {
+				MMAP_CACHE_GET_NEXT(record_topl_entry, dns_topl_record, DNS_TOPL_RECORD_CACHE_SIZE, NULL);
+				strcpy(record_topl_entry->hostname, topl_domain);
+				record_topl_entry->node.key = &record_topl_entry->hostname;
+				MMAP_CACHE_INSERT(record_topl_entry, dns_topl_record);
+			}
+			record_entry->dns_topl_mmap_idx = MMAP_GET_IDX(dns_topl_record, record_topl_entry);
+		} else {
+			error_printf("dns_update - bad domain string: %s\n", c_name);
+			return -1;
+		}
+
 		record_entry->node.key = &record_entry->hostname;
 		MMAP_CACHE_INSERT(record_entry, dns_record);
 	}
@@ -81,12 +112,26 @@ int dns_update(const char *name, const char *addr)
 	struct dns_ip_cache_entry *ip_entry, *tmp2;
 	union dns_ip_cache_key key = { };
 
+	//FIXME IPv4 client can get ipv6 resolution (and probably vice versa)
 	if (inet_pton(AF_INET6, addr, &key.data.addr.in6)) {
 		key.data.family = AF_INET6;
+		if (!c_addr) {
+			memset(&key.data.client_addr.in6, 0, sizeof(key.data.client_addr.in6));
+		} else if (!inet_pton(AF_INET6, c_addr, &key.data.client_addr.in6)) {
+			error_printf("Wrong IP format: %s\n", c_addr);
+			return -1;
+		}
 	}
 	else if (inet_pton(AF_INET, addr, &key.data.addr.in)) {
 		key.data.family = AF_INET;
 		key.data.addr.in.s_addr = be32toh(key.data.addr.in.s_addr);
+		if (!c_addr) {
+			memset(&key.data.client_addr.in, 0, sizeof(key.data.client_addr.in));
+		} else if (!inet_pton(AF_INET, c_addr, &key.data.client_addr.in)) {
+			error_printf("Wrong IP format: %s\n", c_addr);
+			return -1;
+		}
+		key.data.client_addr.in.s_addr = be32toh(key.data.client_addr.in.s_addr);
 	} else {
 		error_printf("Wrong IP format: %s\n", addr);
 		return -1;
@@ -95,7 +140,7 @@ int dns_update(const char *name, const char *addr)
 	ip_entry = avl_find_element(&dns_ip_cache_avl, &key, tmp2, node);
 
 	if (ip_entry) {
-		
+		ip_entry->ttl_expiry = tp.tv_sec + ttl;
 		if (ip_entry->dns_rec_id == record_entry->id) {
 			debug_printf("DNS IP cache - exists.\n");
 			return 0;
@@ -117,8 +162,22 @@ int dns_update(const char *name, const char *addr)
 			debug_printf("dns cache - removing %s\n", format_ipaddr(prev_entry->key.data.family, &prev_entry->key.data.addr, 1));
 		}
 #endif
+		if (dns_ip_cache_mmap_db_len == DNS_IP_CACHE_SIZE) {
+			int i;
+			for (i=0; i<dns_ip_cache_mmap_db_len; ++i) {
+				ip_entry = dns_ip_cache_db + *dns_ip_cache_mmap_next_entry;
+				if (ip_entry->ttl_expiry < tp.tv_sec) break;
+				*dns_ip_cache_mmap_next_entry = (*dns_ip_cache_mmap_next_entry + 1) % DNS_IP_CACHE_SIZE;
+			}
+
+			if (i == dns_ip_cache_mmap_db_len) {
+				error_printf("Error dns_update - dns ip cache not big enough. Removing entry with live ttl.\n");
+			}
+		}
+
 		MMAP_CACHE_GET_NEXT(ip_entry, dns_ip_cache, DNS_IP_CACHE_SIZE, format_dns_ip_key);
 
+		ip_entry->ttl_expiry = tp.tv_sec + ttl;
 		ip_entry->dns_rec_id = record_entry->id;
 		ip_entry->dns_rec_mmap_idx = MMAP_GET_IDX(dns_record, record_entry);
 		ip_entry->key = key;
@@ -129,7 +188,7 @@ int dns_update(const char *name, const char *addr)
 	return 0;
 }
 
-static struct dns_record_entry *get_dns_record_by_addr(uint8_t family, void *addr)
+static struct dns_record_entry *get_dns_record_by_addr(uint8_t family, void *addr, void *c_addr)
 {
 	struct dns_ip_cache_entry *ptr, *tmp;
 	union dns_ip_cache_key key = { };
@@ -137,16 +196,25 @@ static struct dns_record_entry *get_dns_record_by_addr(uint8_t family, void *add
 	if (family == AF_INET6) {
 		key.data.family = AF_INET6;
 		key.data.addr.in6 = *(struct in6_addr *)addr;
-	}
-	else {
+		key.data.client_addr.in6 = *(struct in6_addr *)c_addr;
+	} else {
 		key.data.family = AF_INET;
 		key.data.addr.in = *(struct in_addr *)addr;
+		key.data.client_addr.in = *(struct in_addr *)c_addr;
 	}
 
 	ptr = avl_find_element(&dns_ip_cache_avl, &key, tmp, node);
 
-	if (!ptr)
-		return NULL;
+	if (!ptr) {
+		debug_printf("DNS record lookup for ip:%s\n", format_ipaddr(key.data.family, addr, 1));
+		debug_printf("can not find with client:%s\n", format_ipaddr(key.data.family, c_addr, 1));
+		memset(&key.data.addr.in6, 0, sizeof(key.data.addr.in6));
+		ptr = avl_find_element(&dns_ip_cache_avl, &key, tmp, node);
+		if (!ptr) {
+			debug_printf("can not find with NULL client\n");
+			return NULL;
+		}
+	}
 
 	if (ptr->dns_rec_mmap_idx >= dns_record_mmap_db_len) {
 		debug_printf("dns_get_host_for_addr - dns_rec_mmap_idx(%d) >= DB(%d)\n", ptr->dns_rec_mmap_idx, dns_record_mmap_db_len);
@@ -162,24 +230,38 @@ static struct dns_record_entry *get_dns_record_by_addr(uint8_t family, void *add
 	return rec;
 }
 
-const char *dns_get_host_for_addr(uint8_t family, void *addr)
+const char *dns_get_host_for_addr(uint8_t family, void *addr, void *c_addr)
 {
-	struct dns_record_entry *rec = get_dns_record_by_addr(family, addr);
+	struct dns_record_entry *rec = get_dns_record_by_addr(family, addr, c_addr);
 
 	if (!rec) return NULL;
 
 	return rec->hostname;
 }
 
-uint32_t dns_inc_count_for_addr(uint8_t family, void *addr)
+const char *dns_get_topl(uint16_t topl_mmap_idx)
 {
-	struct dns_record_entry *rec = get_dns_record_by_addr(family, addr);
+	assert(topl_mmap_idx);
+	assert(topl_mmap_idx < dns_topl_record_mmap_db_len);
+	if (topl_mmap_idx >= dns_topl_record_mmap_db_len) {
+		error_printf("dns_get_topl - bad topl_mmap_idx: %d\n", topl_mmap_idx);
+		return NULL;
+	}
+
+	struct dns_topl_record_entry *rec = dns_topl_record_db + topl_mmap_idx;
+	return rec->hostname;
+}
+
+uint16_t dns_inc_count_for_addr(uint8_t family, void *addr, void *c_addr, uint16_t *topl_domain)
+{
+	struct dns_record_entry *rec = get_dns_record_by_addr(family, addr, c_addr);
 
 	if (!rec) return 0;
 
 	++rec->count;
 	debug_printf("dns_inc_count_for_addr - %s (%d)\n", rec->hostname, rec->count);
 
+	*topl_domain = rec->dns_topl_mmap_idx;
 	return rec->id;
 }
 
@@ -220,6 +302,8 @@ avl_cmp_dns_record(const void *k1, const void *k2, void *ptr)
 static int dns_mmap_persist(const char *path, uint32_t timestamp)
 {
 	MMAP_CACHE_SAVE(dns_record, DNS_RECORD_CACHE_SIZE, path, timestamp);
+	MMAP_CACHE_SAVE(dns_ip_cache, DNS_IP_CACHE_SIZE, path, timestamp);
+	MMAP_CACHE_SAVE(dns_topl_record, DNS_TOPL_RECORD_CACHE_SIZE, path, timestamp);
 	return 0;
 }
 
@@ -236,6 +320,8 @@ avl_cmp_dns_record_prune(const void *k1, const void *k2, void *ptr)
 static int dns_archive(const char *path, uint32_t timestamp)
 {
 	MMAP_CACHE_SAVE(dns_record, DNS_RECORD_CACHE_SIZE, path, timestamp);
+	MMAP_CACHE_SAVE(dns_ip_cache, DNS_IP_CACHE_SIZE, path, timestamp);
+	MMAP_CACHE_SAVE(dns_topl_record, DNS_TOPL_RECORD_CACHE_SIZE, path, timestamp);
 
 	//RESET dns_ip_cache_key
 	MMAP_CACHE_RESET(dns_ip_cache, avl_cmp_dns_ip_cache);
@@ -355,10 +441,24 @@ int init_dns(const char *db_path, uint32_t timestamp)
 		MMAP_CACHE_LOAD(dns_record, DNS_RECORD_CACHE_SIZE, hostname, db_path, timestamp, NULL);
 	}
 
+	MMAP_CACHE_INIT(dns_topl_record, DNS_TOPL_RECORD_CACHE_SIZE, avl_cmp_dns_record, hostname, NULL);
+	if (!dns_topl_record_db) return -errno;
+
+	if (dns_topl_record_mmap_db_len == 0) {
+		MMAP_CACHE_LOAD(dns_topl_record, DNS_TOPL_RECORD_CACHE_SIZE, hostname, db_path, timestamp, NULL);
+	}
+
 	for (int i=0; i<dns_record_mmap_db_len; ++i) {
 		struct dns_record_entry *r = dns_record_db + i;
 		if (!r->node.key) continue;
 		if (r->id >= DnsRecordNextID) DnsRecordNextID = r->id+1;
+	}
+
+	if (dns_topl_record_mmap_db_len == 0) {
+		// 0 id is used as a not valid domain
+		struct dns_topl_record_entry *record_topl_entry;
+		MMAP_CACHE_GET_NEXT(record_topl_entry, dns_topl_record, DNS_TOPL_RECORD_CACHE_SIZE, NULL);
+		strcpy(record_topl_entry->hostname, "N/A");
 	}
 
 	return 0;

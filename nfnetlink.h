@@ -23,8 +23,9 @@
 
 #include "database.h"
 
-
 int nfnetlink_connect(int bufsize);
+void nfnetlink_invalidate_active_entries(void);
+int nfnetlink_is_active(uint32_t active_entry_id);
 int nfnetlink_dump(bool allow_insert);
 
 #endif /* __NFNETLINK_H__ */

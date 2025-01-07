@@ -26,6 +26,7 @@
 
 struct notify_params {
 	uint8_t proto;
+	uint8_t notify_flag;
 	uint16_t dst_port;
 	uint8_t type;
 	union {
@@ -35,13 +36,14 @@ struct notify_params {
 	} src;
 	char country[2];
 	uint16_t asn;
+	uint16_t topl_domain;
 };
 
 int init_notify(const char *db_path);
-void notify_new(struct record *r);
+void notify_new(struct record *r, int duration, uint32_t active_entry_id);
 void notify_update(struct record *r);
 void notify_new_client(struct ether_addr *mac);
 int notify_mute_add(struct notify_params *params);
-int notify_is_muted(struct record *r, struct notify_params *params);
+int notify_is_muted(struct record *r, uint8_t notif_record_flag, struct notify_params *params);
 
 #endif

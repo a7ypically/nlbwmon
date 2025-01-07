@@ -72,7 +72,7 @@ format_macaddr(struct ether_addr *mac)
 }
 
 char *
-format_ipaddr(int family, void *addr, int is_host_order)
+format_ipaddr(int family, const void *addr, int is_host_order)
 {
 	static char buf[INET6_ADDRSTRLEN];
 
@@ -91,3 +91,11 @@ format_ipaddr(int family, void *addr, int is_host_order)
 
 	return buf;
 }
+
+int tp_diff(struct timespec *start, struct timespec *end) {
+    int ms;
+    ms = (end->tv_sec - start->tv_sec) * 1000;
+    ms += (end->tv_nsec - start->tv_nsec) / 1000000;
+    return ms;
+}
+

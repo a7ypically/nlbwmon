@@ -27,6 +27,7 @@
 #include "nlbwmon.h"
 
 static int ProtocolAll = 0;
+uint16_t DNS_UDP_NET_PORT;
 
 static int
 avl_cmp_proto(const void *k1, const void *k2, void *ptr)
@@ -46,6 +47,7 @@ init_protocols(const char *database)
 	uint8_t proto;
 	FILE *in;
 
+	DNS_UDP_NET_PORT = htons(53);
 	ProtocolAll = config_get_uint32("all_protocols", 1) != 0;
 
 	in = fopen(opt.protocol_db, "r");

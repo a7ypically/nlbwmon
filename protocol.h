@@ -25,6 +25,7 @@
 #define PR_NAMELEN 32
 #define PR_SCANFMT "%hhu %hu %32[^\n]\n"
 
+extern uint16_t DNS_UDP_NET_PORT;
 
 struct protocol {
 	uint8_t proto;

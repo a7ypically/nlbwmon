@@ -21,6 +21,7 @@
 #include <net/ethernet.h>
 
 #define MAX_HOST_NAME 31
+#define NEIGH_MAX_STAT_IPS 4
 
 #define TYPE_NO_NAME	   0
 #define TYPE_DHCP_PROVIDED 1
@@ -33,11 +34,25 @@ struct hosts_record_entry {
 	struct avl_node node;
 };
 
+struct hosts_stat {
+  struct hosts_record_entry *record;
+  struct {
+    uint8_t family;
+    union {
+      struct in_addr in;
+      struct in6_addr in6;
+    } addr;
+  } ip[NEIGH_MAX_STAT_IPS];
+  uint64_t conn_count;
+};
+
 int hosts_update(const char *name, const char *macaddr, uint8_t type);
 int hosts_update_by_addr(const char *name, struct ether_addr *addr, uint8_t type);
 const char *lookup_hostname(struct ether_addr *macaddr);
 int hosts_is_known(struct ether_addr *macaddr);
+struct hosts_stat *hosts_get_all(size_t *count);
 int init_hosts(const char *db_path, uint32_t timestamp);
 int hosts_is_new(struct ether_addr *macaddr);
+int hosts_clean();
 
 #endif

@@ -138,8 +138,13 @@ static int geoip_on_data_cb(struct ustream *s, int eof)
 
 	do {
 		str = ustream_get_read_buf(s, &len);
-		if (!str)
+		if (!str) {
+			if (eof && (geoip_state != GEOIP_STATE_READ_ERROR)) {
+				geoip_state = GEOIP_STATE_IDLE;
+				debug_printf("End of data\n");
+			}
 			break;
+		}
 
 		if (geoip_state == GEOIP_STATE_READ_ERROR) {
 			char *str_itr, *end;
@@ -247,7 +252,7 @@ static int geoip_on_data_cb(struct ustream *s, int eof)
 					str_itr += 5;
 					str = strchr(str_itr, '"') + 1;
 					end = strchr(str, '"');
-					while ((*end-1) == '\\') end = strchr(end+1, '"');
+					while (*(end-1) == '\\') end = strchr(end+1, '"');
 					*end = 0;
 					if ((str[0] != 'A') || (str[1] != 'S')) {
 						debug_printf("Can't parse ASN number: %s\n", str);
@@ -332,11 +337,39 @@ static int geoip_mmap_persist(const char *path, uint32_t timestamp)
 
 static int geoip_archive(const char *path, uint32_t timestamp)
 {
-	//RESET geoip cache
-	MMAP_CACHE_RESET(geoip, avl_cmp_geoip);
-	MMAP_CACHE_SAVE(geoip, GEOIP_MMAP_CACHE_SIZE, path, 0);
+	int new_idx = 0;
+	for (int i = 0; i < geoip_mmap_db_len; i++) {
+		if (geoip_db[i].node.key && geoip_db[i].country[1] == 1) {
+			if (i != new_idx) {
+				struct geoip_entry swap = geoip_db[new_idx];
+				geoip_db[new_idx] = geoip_db[i];
+				geoip_db[i] = swap;
+			}
+			new_idx++;
+		}
+	}
 
+	if (new_idx == 0) {
+		MMAP_CACHE_RESET(geoip, avl_cmp_geoip);
+	} else {
+		memset(geoip_db + new_idx, 0,
+		       sizeof(struct geoip_entry) * (geoip_mmap_db_len - new_idx));
+		*geoip_mmap_next_entry = new_idx;
+		geoip_mmap_db_len = new_idx;
+		avl_init(&geoip_avl, avl_cmp_geoip, false, NULL);
+		for (int i = 0; i < geoip_mmap_db_len; i++) {
+			geoip_db[i].node.key = &geoip_db[i].key;
+			avl_insert(&geoip_avl, &geoip_db[i].node);
+		}
+	}
+
+	MMAP_CACHE_SAVE(geoip, GEOIP_MMAP_CACHE_SIZE, path, 0);
 	return 0;
+}
+
+int geoip_is_bogon(const char *country)
+{
+	return (country[0] == 0) && (country[1] == 9);
 }
 
 int init_geoip_mmap(const char *db_path)
@@ -370,6 +403,7 @@ int init_geoip_mmap(const char *db_path)
 
 static void geoip_on_https_error(void)
 {
+	error_printf("Error in ipinfo.io API: Unknown\nAPI will not be used until service restart.\n");
 	tg_send_msg("Error in ipinfo.io API: Unknown\nAPI will not be used until service restart.\n");
 	geoip_state = GEOIP_STATE_READ_ERROR;
 }
@@ -381,6 +415,6 @@ static struct https_cbs geoip_https_cbs = {
 	
 __attribute__((constructor)) static void init_geoip(void)
 {
-        geoip_https_ctx = https_init(&geoip_https_cbs, "ipinfo.io", 443);
+        geoip_https_ctx = https_init(&geoip_https_cbs, "ipinfo.io", 443, 10);
 }
 

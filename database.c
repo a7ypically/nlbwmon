@@ -72,7 +72,8 @@ void print_record(struct record *r)
 	}
 	country[2] = 0;
 
-	debug_printf("Record - f:%d proto:%d dst_port:%d mac:%s src:%s country:%s lonlat:%d,%d asn:%d\n", r->family, r->proto, r->dst_port, format_macaddr(&r->src_mac.ea), src_name, country, r->lonlat[0], r->lonlat[1], r->asn);
+	debug_printf("Record - f:%d proto:%d dst_port:%d mac:%s src:%s country:%s lonlat:%d,%d asn:%d ", r->family, r->proto, r->dst_port, format_macaddr(&r->src_mac.ea), src_name, country, r->lonlat[0], r->lonlat[1], r->asn);
+	debug_printf("last_ext_addr:%s\n", format_ipaddr(r->family, &r->last_ext_addr, 1));
 }
 #else
 #define print_record(R)
@@ -173,8 +174,8 @@ database_grow(struct dbhandle *h)
 
 	size = h->size + (h->size >> 1);
 
-	if (h->limit > 0 && size > h->limit)
-		size = h->limit;
+	//if (h->limit > 0 && size > h->limit)
+	//	size = h->limit;
 
 	if (size <= h->size)
 		return -ENOSPC;
@@ -300,6 +301,17 @@ database_insert(struct dbhandle *h, struct record *rec, struct record **db_rec)
 
 #define add64(x, y) x = htobe64(be64toh(x) + be64toh(y))
 
+void database_update_record(struct record *rec, struct record *ptr)
+{
+	ptr->last_ext_addr = rec->last_ext_addr;
+	add64(ptr->count, rec->count);
+	add64(ptr->in_pkts, rec->in_pkts);
+	add64(ptr->in_bytes, rec->in_bytes);
+	add64(ptr->out_pkts, rec->out_pkts);
+	add64(ptr->out_bytes, rec->out_bytes);
+	ptr->flags |= rec->flags;
+}
+
 int
 database_update(struct dbhandle *h, struct record *rec, struct record **db_rec)
 {
@@ -308,13 +320,7 @@ database_update(struct dbhandle *h, struct record *rec, struct record **db_rec)
 	ptr = avl_find_element(&h->index, rec, ptr, node);
 
 	if (ptr) {
-		ptr->last_ext_addr = rec->last_ext_addr;
-		add64(ptr->count, rec->count);
-		add64(ptr->in_pkts, rec->in_pkts);
-		add64(ptr->in_bytes, rec->in_bytes);
-		add64(ptr->out_pkts, rec->out_pkts);
-		add64(ptr->out_bytes, rec->out_bytes);
-		ptr->flags |= rec->flags;
+		database_update_record(rec, ptr);
 
 		if (db_rec) *db_rec = ptr;
 
@@ -322,6 +328,16 @@ database_update(struct dbhandle *h, struct record *rec, struct record **db_rec)
 	}
 
 	return -ENOENT;
+}
+
+void database_reindex_record(struct record *r)
+{
+	avl_delete(&gdbh->index, &r->node);
+
+	r->node.key = r;
+	if (avl_insert(&gdbh->index, &r->node)) {
+		error_printf("Error database_reindex_record - Error adding record after delete.\n");
+	}
 }
 
 static int
@@ -685,6 +701,9 @@ database_archive(struct dbhandle *h)
 	int err;
 
 	if (next_ts > curr_ts) {
+
+		nfnetlink_invalidate_active_entries();
+
 		err = database_save(h, opt.db.directory, curr_ts, opt.db.compress);
 
 		if (err)
@@ -697,7 +716,7 @@ database_archive(struct dbhandle *h)
 
 		database_reindex(h);
 
-		/* carry over yet open streams to new database */
+		// Perform a new dump
 		err = nfnetlink_dump(true);
 
 		struct db_archive_cb_entry *entry;
@@ -752,7 +771,7 @@ struct record *database_get_by_idx(int idx, uint32_t *md5)
 	md5_end(r_md5, &ctx);
 
 	if (memcmp(r_md5, md5, sizeof(r_md5))) {
-		debug_printf("database_get_by_idx (%d), md5 mismatch.\n", idx);
+		debug_printf("Error database_get_by_idx (%d), md5 mismatch.\n", idx);
 		return NULL;
 	}
 

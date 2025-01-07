@@ -57,8 +57,10 @@
 
 #define RECORD_TYPE_WAN 0x1
 #define RECORD_TYPE_WAN_IN 0x2
-#define RECORD_FLAG_NOTIF_COUNTRY 0x1
-#define RECORD_FLAG_NOTIF_UPLOAD 0x2
+#define RECORD_FLAG_NOTIF_INBOUND 0x1
+#define RECORD_FLAG_NOTIF_COUNTRY 0x2
+#define RECORD_FLAG_NOTIF_UPLOAD  0x4
+#define RECORD_FLAG_NOTIF_NO_DNS  0x8
 
 #define RECORD_NUM_HOSTS 4
 
@@ -79,7 +81,9 @@ struct record {
 	char country[2];
 	int32_t lonlat[2];
 	uint16_t asn;
+	uint16_t topl_domain;
 	uint64_t count;
+	time_t duration;
 	uint16_t hosts[RECORD_NUM_HOSTS];
 	struct in6_addr last_ext_addr;
 	uint8_t flags;
@@ -115,7 +119,9 @@ struct dbhandle * database_init(const struct interval *intv, bool prealloc,
                                 uint32_t limit);
 
 int database_insert(struct dbhandle *h, struct record *rec, struct record **db_rec);;
+void database_update_record(struct record *rec, struct record *ptr);
 int database_update(struct dbhandle *h, struct record *rec, struct record **db_rec);
+void database_reindex_record(struct record *r);
 
 void database_reorder(struct dbhandle *h, avl_tree_comp sort_fn,
                       void *sort_ptr);

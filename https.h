@@ -29,7 +29,7 @@ struct https_cbs {
 
 struct https_ctx;
 
-void *https_init(struct https_cbs *cbs, const char *host, uint32_t port);
+void *https_init(struct https_cbs *cbs, const char *host, uint32_t port, uint8_t timeout);
 void https_set_require_validation(struct https_ctx *ctx, int require);
 void https_set_retries(struct https_ctx *ctx, int retries, int delay);
 void https_send_msg(struct https_ctx *ctx, const char *url, const char *data, const char *data_content_type);

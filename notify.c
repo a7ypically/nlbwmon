@@ -186,8 +186,10 @@ int init_notify(const char *db_path) {
 	NotifySigUploadRatio = config_get_uint32("notify_outbound_ratio", 50);
 	DnsNoWan = config_get_uint32("no_dns_for_wan", 1);
 
-	notify_no_dns_tm.cb = notify_start_no_dns;
-	uloop_timeout_set(&notify_no_dns_tm, 24 * 3600 * 1000);
+	if (config_get_uint32("notify_no_dns", 0)) {
+		notify_no_dns_tm.cb = notify_start_no_dns;
+		uloop_timeout_set(&notify_no_dns_tm, 24 * 3600 * 1000);
+	}
 	return 0;
 }
 

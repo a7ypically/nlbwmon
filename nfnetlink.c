@@ -720,6 +720,7 @@ parse_event(void *reply, int len, int type, bool update_mac)
 					error_printf("Error parse_event - not found in active_table!\n");
 				}
 			}
+			active_entry->dump_counter = DumpCounter + 1;
 		}
 
 		if (r.type & RECORD_TYPE_WAN) {
@@ -802,7 +803,11 @@ handle_event(struct nl_msg *msg, void *arg)
 	struct nlmsghdr *hdr = nlmsg_hdr(msg);
 
 	int type = 0;
-	if (NFNL_MSG_TYPE(hdr->nlmsg_type) == IPCTNL_MSG_CT_NEW) type = EVENT_TYPE_NEW;
+	if (NFNL_MSG_TYPE(hdr->nlmsg_type) == IPCTNL_MSG_CT_NEW) {
+		if (hdr->nlmsg_flags & NLM_F_CREATE) {
+			type = EVENT_TYPE_NEW;
+		}
+	}
 	else if (NFNL_MSG_TYPE(hdr->nlmsg_type) == IPCTNL_MSG_CT_DELETE) type = EVENT_TYPE_DELETED;
 
 	parse_event(hdr, hdr->nlmsg_len, type, type == EVENT_TYPE_NEW);
@@ -910,8 +915,8 @@ nfnetlink_connect(int bufsize)
 		return -errno;
 
 	if (nl_socket_add_memberships(nl_event_sock, NFNLGRP_CONNTRACK_NEW,
-					  //NFNLGRP_CONNTRACK_UPDATE,
-	                                  NFNLGRP_CONNTRACK_DESTROY, 0))
+					NFNLGRP_CONNTRACK_UPDATE,
+	                NFNLGRP_CONNTRACK_DESTROY, 0))
 		return -errno;
 
 	ufd.cb = handle_nl_sock_event;
@@ -1100,7 +1105,7 @@ err:
 		struct active_table *next = active_table_next(&active_table_avl, rec);
 
 		if (rec->dump_counter != DumpCounter) {
-			if (recently_oom || (DumpInsertCounter && (rec->dump_counter == DumpInsertCounter))) {
+			if (recently_oom) { //|| (DumpInsertCounter && (rec->dump_counter == (DumpInsertCounter + 3)))) {
 				// Handle as DELETE event
 
 				if (recently_oom) {
@@ -1131,7 +1136,7 @@ err:
 					++invalid_cnt;
 				} else {
 					if (rec->dump_counter && (rec->dump_counter < (DumpCounter - 1))) {
-						error_printf("Error - leftover entry in active table:\n");
+						debug_printf("Error - leftover entry in active table:\n");
 					}
 					debug_printf("Dump zombie (%u) - counter:%d\n", rec->id, rec->dump_counter);
 					if (rec->flags & ACTIVE_TABLE_FLAG_DB_PTR_VALID) {
@@ -1141,6 +1146,9 @@ err:
 					if (!rec->dump_counter) ++rec->dump_counter;
 					if (allow_insert) {
 						debug_printf("Removing leftover due to dump insert\n");
+						active_entry_delete(rec);
+					} else if (rec->dump_counter && ((rec->dump_counter + 20) < DumpCounter)) {
+						debug_printf("Removing leftover - too old.\n");
 						active_entry_delete(rec);
 					}
 				}

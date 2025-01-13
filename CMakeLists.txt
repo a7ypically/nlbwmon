@@ -8,7 +8,7 @@ OPTION(LIBNL_LIBRARY_TINY "Use LEDE/OpenWrt libnl-tiny" OFF)
 SET(SOURCES
 	abuseipdb.c client.c database.c geoip.c https.c nfnetlink.c notify.c
     	socket.c tg.c timing.c utils.c asn.c config.c dns.c hosts.c neigh.c
-    	nlbwmon.c protocol.c subnets.c tg_poll.c ubus.c wans.c)
+    	nlbwmon.c protocol.c subnets.c tg_poll.c ubus.c wans.c socket_net.c)
 
 ADD_EXECUTABLE(nlbwmon ${SOURCES})
 

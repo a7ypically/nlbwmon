@@ -459,6 +459,8 @@ int init_dns(const char *db_path, uint32_t timestamp)
 		struct dns_topl_record_entry *record_topl_entry;
 		MMAP_CACHE_GET_NEXT(record_topl_entry, dns_topl_record, DNS_TOPL_RECORD_CACHE_SIZE, NULL);
 		strcpy(record_topl_entry->hostname, "N/A");
+		record_topl_entry->node.key = &record_topl_entry->hostname;
+		MMAP_CACHE_INSERT(record_topl_entry, dns_topl_record);
 	}
 
 	return 0;

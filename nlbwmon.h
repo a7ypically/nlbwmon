@@ -43,6 +43,7 @@ struct options {
 	const char *protocol_db;
 	const char *tempdir;
 	const char *socket;
+	const char *socket_net_port;
 
 	struct {
 		bool compress;

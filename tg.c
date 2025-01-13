@@ -334,12 +334,10 @@ static void tg_format_inline_keys(struct tg_msg_entry *msg, char *msg_str, int m
 			return;
 		}
 
-		if (TGCallbackState[3] > 9) {
-			if (TGCallbackState[3] == 1) {
-				snprintf(str, sizeof(str), "%s", get_protocol_name(msg->rec_key.proto, ntohs(msg->rec_key.dst_port)));
-			} else {
-				snprintf(str, sizeof(str), "%s any port", get_protocol_name(msg->rec_key.proto, 0));
-			}
+		if (TGCallbackState[3] == 1) {
+			snprintf(str, sizeof(str), "%s", get_protocol_name(msg->rec_key.proto, ntohs(msg->rec_key.dst_port)));
+		} else {
+			snprintf(str, sizeof(str), "%s any port", get_protocol_name(msg->rec_key.proto, 0));
 		}
 
 		len = snprintf(msg_str, msg_size, "using %s ",

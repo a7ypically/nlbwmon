@@ -197,7 +197,7 @@ static struct https_cbs tg_poll_https_cbs = {
 };
 	
 int init_tg_poll(void) {
-	tg_poll_https_ctx = https_init(&tg_poll_https_cbs, "api.telegram.org", 443);
+	tg_poll_https_ctx = https_init(&tg_poll_https_cbs, "api.telegram.org", 443, 0);
 
 	if (!tg_get_token()) {
 		error_printf("Telegram token is not set. TG will not be used.\n");

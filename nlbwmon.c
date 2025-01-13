@@ -49,6 +49,7 @@
 #include "nfnetlink.h"
 #include "subnets.h"
 #include "socket.h"
+#include "socket_net.h"
 #include "client.h"
 #include "utils.h"
 #include "ubus.h"
@@ -80,6 +81,7 @@ struct options opt = {
 
 	.tempdir = "/tmp/nlbwmon",
 	.socket = "/var/run/nlbwmon.sock",
+	.socket_net_port = "1998",
 	.protocol_db = "/usr/share/nlbwmon/protocols",
 
 	.db = {
@@ -230,7 +232,7 @@ server_main(int argc, char **argv)
 	uint32_t timestamp;
 	int optchr, err;
 	char *e;
-	int dns_listen_port = -1;
+	const char *dns_listen_port = NULL;
 
 	while ((optchr = getopt(argc, argv, "d:b:i:r:s:w:o:p:G:I:L:PZ")) > -1) {
 		switch (optchr) {
@@ -244,7 +246,7 @@ server_main(int argc, char **argv)
 			break;
 
 		case 'd':
-			dns_listen_port = atoi(optarg);
+			dns_listen_port = strdup(optarg);
 			break;
 
 		case 'i':
@@ -406,6 +408,13 @@ server_main(int argc, char **argv)
 		exit(1);
 	}
 
+	err = socket_net_init(opt.socket_net_port);
+	if (err) {
+		fprintf(stderr, "Unable to create control net socket: %s\n",
+		        strerror(-err));
+		exit(1);
+	}
+
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
@@ -418,7 +427,7 @@ server_main(int argc, char **argv)
 	uloop_timeout_set(&refresh_tm, opt.refresh_interval * 1000);
 
 	init_ubus();
-	if (dns_listen_port > 0)
+	if (dns_listen_port)
 		dns_listen_run(dns_listen_port);
 
 	err = nfnetlink_dump(true);

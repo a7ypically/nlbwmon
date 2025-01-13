@@ -174,6 +174,8 @@ database_grow(struct dbhandle *h)
 
 	size = h->size + (h->size >> 1);
 
+	// FIXME. There are pointers directly to the database struct, so we can't
+	// reuse old enrties.
 	//if (h->limit > 0 && size > h->limit)
 	//	size = h->limit;
 

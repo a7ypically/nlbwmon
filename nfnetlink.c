@@ -100,6 +100,9 @@ static struct nla_policy ct_protoinfo_tcp_policy[CTA_PROTOINFO_TCP_MAX+1] = {
 	[CTA_PROTOINFO_TCP_FLAGS_REPLY]		= { .minlen = 2 },
 };
 
+static int
+handle_event(struct nl_msg *msg, void *arg);
+
 static int ct_parse_protoinfo_tcp(struct nlattr *attr)
 {
 	struct nlattr *tb[CTA_PROTOINFO_TCP_MAX+1];
@@ -770,6 +773,47 @@ parse_event(void *reply, int len, int type, bool update_mac)
 }
 
 static void
+handle_nl_sock_event(struct uloop_fd *fd, unsigned int ev);
+
+static int setup_nl_event_sock(int bufsize) {
+	static int last_buf_size;
+
+	if (bufsize) last_buf_size = bufsize;
+
+	nl_event_sock = nl_socket_alloc();
+
+	if (!nl_event_sock)
+		return -ENOMEM;
+
+	nl_socket_disable_seq_check(nl_event_sock);
+
+	if (nl_socket_modify_cb(nl_event_sock, NL_CB_VALID, NL_CB_CUSTOM, handle_event, NULL))
+		return -errno;
+
+	if (nl_connect(nl_event_sock, NETLINK_NETFILTER))
+		return -errno;
+
+	if (nl_socket_set_nonblocking(nl_event_sock))
+		return -errno;
+
+	if (nl_socket_set_buffer_size(nl_event_sock, last_buf_size*4, 32*1024))
+		return -errno;
+
+	if (nl_socket_add_memberships(nl_event_sock, NFNLGRP_CONNTRACK_NEW,
+					NFNLGRP_CONNTRACK_UPDATE,
+	                NFNLGRP_CONNTRACK_DESTROY, 0))
+		return -errno;
+
+	ufd.cb = handle_nl_sock_event;
+	ufd.fd = nl_socket_get_fd(nl_event_sock);
+
+	if (uloop_fd_add(&ufd, ULOOP_READ))
+		return -errno;
+
+	return 0;
+}
+
+static void
 handle_nl_sock_event(struct uloop_fd *fd, unsigned int ev)
 {
 	struct timespec start, end;
@@ -787,6 +831,12 @@ handle_nl_sock_event(struct uloop_fd *fd, unsigned int ev)
 			last_oom_ts = start;
 			// Run a full dump to re-sync
 			debug_printf("Error - OOM detected, running full dump to resync...\n");
+
+			nl_socket_free(nl_event_sock);
+			if (setup_nl_event_sock(0) != 0) {
+				error_printf("Error setting up netlink event socket\n");
+				exit(1);
+			}
 			nfnetlink_dump(true);
 		}
 	}
@@ -885,7 +935,6 @@ check_rmem_max(int bufsize)
 		        bufsize, max, bufsize);
 }
 
-
 int
 nfnetlink_connect(int bufsize)
 {
@@ -895,36 +944,10 @@ nfnetlink_connect(int bufsize)
 
 	avl_init(&active_table_avl, avl_cmp_active_id, false, NULL);
 
-	nl_event_sock = nl_socket_alloc();
-
-	if (!nl_event_sock)
-		return -ENOMEM;
-
-	nl_socket_disable_seq_check(nl_event_sock);
-
-	if (nl_socket_modify_cb(nl_event_sock, NL_CB_VALID, NL_CB_CUSTOM, handle_event, NULL))
-		return -errno;
-
-	if (nl_connect(nl_event_sock, NETLINK_NETFILTER))
-		return -errno;
-
-	if (nl_socket_set_nonblocking(nl_event_sock))
-		return -errno;
-
-	if (nl_socket_set_buffer_size(nl_event_sock, bufsize*2, 32*1024))
-		return -errno;
-
-	if (nl_socket_add_memberships(nl_event_sock, NFNLGRP_CONNTRACK_NEW,
-					NFNLGRP_CONNTRACK_UPDATE,
-	                NFNLGRP_CONNTRACK_DESTROY, 0))
-		return -errno;
-
-	ufd.cb = handle_nl_sock_event;
-	ufd.fd = nl_socket_get_fd(nl_event_sock);
-
-	if (uloop_fd_add(&ufd, ULOOP_READ))
-		return -errno;
-
+	int ret = setup_nl_event_sock(bufsize);
+	if (ret) {
+		return ret;
+	}
 
 	nl_dump_sock = nl_socket_alloc();
 

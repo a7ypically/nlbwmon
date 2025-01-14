@@ -290,7 +290,7 @@ int init_hosts(const char *db_path, uint32_t timestamp)
 	if (!hosts_record_db) return -errno;
 
 	if (hosts_record_mmap_db_len == 0) {
-		MMAP_CACHE_LOAD(hosts_record, HOSTS_RECORD_CACHE_SIZE, mac_addr, db_path, timestamp, format_hosts_record_key);
+		MMAP_CACHE_LOAD(hosts_record, HOSTS_RECORD_CACHE_SIZE, mac_addr, db_path, 0, format_hosts_record_key);
 	}
 
 	// One minute grace of avoiding new client notifications on first run

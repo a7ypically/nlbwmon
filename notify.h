@@ -45,5 +45,6 @@ void notify_update(struct record *r);
 void notify_new_client(struct ether_addr *mac);
 int notify_mute_add(struct notify_params *params);
 int notify_is_muted(struct record *r, uint8_t notif_record_flag, struct notify_params *params);
+struct notify_params **notify_get_all(size_t *count);
 
 #endif

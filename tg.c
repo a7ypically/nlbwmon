@@ -1304,6 +1304,202 @@ static int format_host_entry(char *buf, size_t size, const struct hosts_stat *st
     return len;
 }
 
+static int compare_rules(const void *a, const void *b) {
+	const struct notify_params *ra = *(struct notify_params **)a;
+	const struct notify_params *rb = *(struct notify_params **)b;
+
+	// Primary sort: WAN rules FIRST (higher priority)
+	const int wan_a = !!(ra->type & RECORD_TYPE_WAN);
+	const int wan_b = !!(rb->type & RECORD_TYPE_WAN);
+	if (wan_a != wan_b) return wan_b - wan_a;
+
+	// Scoring for field specificity - higher score = more specific
+	int score_a = 0, score_b = 0;
+	// Field weights in reverse order of listed priorities to match priority
+	const int coeff[5] = {1, 2, 4, 8, 16}; // port, proto, asn, domain, countr
+
+	score_a += (ra->dst_port) ? coeff[0] : 0;
+	score_a += (ra->proto) ? coeff[1] : 0;
+	score_a += (ra->asn) ? coeff[2] : 0;
+	score_a += (ra->topl_domain) ? coeff[3] : 0;
+	score_a += (ra->country[0]) ? coeff[4] : 0;
+
+	score_b += (rb->dst_port) ? coeff[0] : 0;
+	score_b += (rb->proto) ? coeff[1] : 0;
+	score_b += (rb->asn) ? coeff[2] : 0;
+	score_b += (rb->topl_domain) ? coeff[3] : 0;
+	score_b += (rb->country[0]) ? coeff[4] : 0;
+
+	// Less specific (lower score) comes first
+	if (score_a != score_b) return score_a - score_b;
+
+	// Tiebreaker 1: Compare individual fields starting with highest priority
+	const int fields[] = {4, 3, 2, 1, 0}; // Country, domain, asn, proto, port
+	for (int i = 0; i < 5; i++) {
+		int cmp = 0;
+		switch(fields[i]) {
+			case 4: // Country
+				cmp = memcmp(ra->country, rb->country, 2);
+				if (cmp) return cmp;
+				break;
+			case 3: // Domain
+				cmp = (int)(ra->topl_domain - rb->topl_domain);
+				if (cmp) return cmp;
+				break;
+			case 2: // ASN
+				cmp = (int)(ra->asn - rb->asn);
+				if (cmp) return cmp;
+				break;
+			case 1: // Protocol
+				cmp = ra->proto - rb->proto;
+				if (cmp) return cmp;
+				break;
+			case 0: // Port
+				cmp = ntohs(ra->dst_port) - ntohs(rb->dst_port);
+				if (cmp) return cmp;
+				break;
+		}
+	}
+
+	// Final tiebreaker: MAC address or interface index
+	if (wan_a) { // Both are WAN rules - compare interface indexes
+		return ra->src.wan_idx - rb->src.wan_idx;
+	}
+	// Compare MAC addresses for client rules
+	return memcmp(&ra->src.ea, &rb->src.ea, sizeof(struct ether_addr));
+}
+
+static void send_notify_rules(const char *filter_client) {
+    size_t count;
+    struct notify_params **rules = notify_get_all(&count);
+    if (!rules || count == 0) {
+        tg_send_msg("No notification rules configured.");
+        return;
+    }
+
+	// Sort rules in-place
+    qsort(rules, count, sizeof(struct notify_params *), compare_rules);
+
+    char msg[1024];
+    int msg_len = 0;
+    int rules_in_msg = 0;
+
+    msg_len += snprintf(msg + msg_len, sizeof(msg) - msg_len, "📜 Notification rules:\n\n");
+
+    for (size_t i = 0; i < count; i++) {
+        struct notify_params *r = rules[i];
+        char rule_str[512];
+        int rule_len = 0;
+        
+        // Resolve source
+        const char *src_name;
+        const char *direction = "";
+        if (r->type & RECORD_TYPE_WAN) {
+            src_name = get_wan_name(r->src.wan_idx);
+            direction = (r->type & RECORD_TYPE_WAN_IN) ? "🔒 Inbound to" : "🔓 Outbound from";
+        } else if (r->src.u64) {
+            struct ether_addr mac = r->src.ea;
+            const char *name = lookup_hostname(&mac);
+            src_name = name ? name : format_macaddr(&mac);
+            direction = (r->type & RECORD_TYPE_WAN_IN) ? "🔒 Inbound to" : "🔓 Outbound from";
+        } else {
+            src_name = "Any device";
+            direction = (r->type & RECORD_TYPE_WAN_IN) ? "🔒 Inbound to" : "🔓 Outbound from";
+        }
+
+        // Apply client filter
+        if (filter_client) {
+            bool match = false;
+            if (r->type & RECORD_TYPE_WAN) {
+                match = (strcasecmp(src_name, filter_client) == 0);
+            } else {
+                if (!r->src.u64) continue; // Skip global rules when filtering
+                const char *client_name = lookup_hostname(&r->src.ea);
+                match = client_name && (strcasecmp(client_name, filter_client) == 0);
+            }
+            if (!match) continue;
+        }
+
+        // Format connection type
+        const char *types[4];
+        int type_count = 0;
+        if (r->notify_flag & RECORD_FLAG_NOTIF_INBOUND) types[type_count++] = "Incoming Connection";
+        if (r->notify_flag & RECORD_FLAG_NOTIF_COUNTRY) types[type_count++] = "To Country";
+        if (r->notify_flag & RECORD_FLAG_NOTIF_UPLOAD) types[type_count++] = "Large upload";
+        if (r->notify_flag & RECORD_FLAG_NOTIF_NO_DNS) types[type_count++] = "No DNS";
+
+        // Protocol info
+        const char *proto_str = "";
+        if (r->proto) {
+            if (r->dst_port) {
+                proto_str = get_protocol_name(r->proto, r->dst_port);
+            } else {
+                proto_str = get_protocol_name(r->proto, 0);
+                if (strstr(proto_str, " ")) proto_str = "All UDP/TCP";  // Cleanup if "proto 0"
+            }
+        }
+
+        // Geography
+        const char *geo_str = "";
+        if (r->country[0]) {
+            char flag[12];
+            snprintf(flag, sizeof(flag), "%s", get_flag_emoji(r->country));
+            geo_str = flag;
+        }
+
+        // Organization/Domain
+        const char *asn_str = r->asn ? lookup_asn(r->asn) : NULL;
+        const char *domain_str = r->topl_domain ? dns_get_topl(r->topl_domain) : NULL;
+        char org_buf[128] = "";
+        if (asn_str && domain_str) {
+            snprintf(org_buf, sizeof(org_buf), "%s (%s)", asn_str, domain_str);
+        } else if (asn_str || domain_str) {
+            snprintf(org_buf, sizeof(org_buf), "%s", asn_str ? asn_str : domain_str);
+        }
+
+        rule_len += snprintf(rule_str + rule_len, sizeof(rule_str) - rule_len,
+            "%s %s%s%s\n"
+            "%s %s\n"
+            "Scope: %s %s\n"
+            "Protocol: %s\n"
+            "Matches: %s\n\n",
+            (r->type & RECORD_TYPE_WAN) ? "🌐 OpenWRT" : "💻 Client",
+            geo_str,
+            *geo_str && *org_buf ? " " : "",
+            org_buf,
+            direction,
+            src_name,
+            (r->type & RECORD_TYPE_WAN) ? "OpenWRT" : "Client",
+            type_count ? types[0] : "All traffic",
+            *proto_str ? proto_str : "Any protocol",
+            type_count > 1 ? types[1] : types[0]
+        );
+
+        // Overflow protection
+        if (msg_len + rule_len >= sizeof(msg)) {
+            if (msg_len > 0) {
+                tg_send_msg(msg);
+                msg_len = 0;
+                rules_in_msg = 0;
+            }
+        }
+
+        strcpy(msg + msg_len, rule_str);
+        msg_len += rule_len;
+        rules_in_msg++;
+    }
+
+    if (rules_in_msg > 0) {
+        tg_send_msg(msg);
+    } else if (filter_client) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "No rules found for client '%s'", filter_client);
+        tg_send_msg(buf);
+    }
+
+    free(rules);
+}
+
 static void send_hosts_list(void) {
     size_t count;
     struct hosts_stat *stats = hosts_get_all(&count);
@@ -1426,6 +1622,15 @@ void tg_on_poll_text(int chat_id, int message_id, char *text)
 		char msg[64];
 		snprintf(msg, sizeof(msg), "%d hosts removed from database.", num_removed);
 		tg_send_msg(msg);
+        return;
+    }
+
+    else if (strncmp(text, "/rules", 6) == 0) {
+        const char *filter = NULL;
+        if (strlen(text) > 7) {
+            filter = text + 7;
+        }
+        send_notify_rules(filter);
         return;
     }
 

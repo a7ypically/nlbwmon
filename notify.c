@@ -120,6 +120,25 @@ static int notify_mmap_persist(const char *path, uint32_t timestamp)
 	return 0;
 }
 
+struct notify_params **notify_get_all(size_t *count) {
+    *count = notify_rule_avl.count;
+    struct notify_params **rules = calloc(*count, sizeof(struct notify_params *));
+    
+    if (!rules) {
+        *count = 0;
+        return NULL;
+    }
+
+    struct notify_rule_entry *ptr;
+    size_t i = 0;
+
+    avl_for_each_element(&notify_rule_avl, ptr, node) {
+        rules[i++] = &ptr->params;
+    }
+
+    return rules;
+}
+
 static int
 avl_cmp_notify_rules(const void *k1, const void *k2, void *ptr)
 {

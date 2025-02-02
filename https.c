@@ -118,10 +118,11 @@ static void connect_client(struct https_ctx *ctx);
 
 static void retry(struct https_ctx *ctx)
 {
+	error_printf("Error in retry - %s\n", ctx->host);
 	https_close(ctx);
+	error_printf("After close\n");
 	ctx->num_retries++;
 	ctx->state = STREAM_STATE_RETRY;
-	error_printf("Error in retry - %s\n", ctx->host);
 	if (ctx->num_retries >= ctx->max_retries) {
 		error_printf("Error in http. Out of retries.\n");
 		ctx->cbs->error();

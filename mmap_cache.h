@@ -32,11 +32,12 @@
 #define CONCAT_(a, b) a##b
 #define CONCAT(a, b) CONCAT_(a, b)
 
-#define DEFINE_MMAP_CACHE(TYPE) \
+#define DEFINE_MMAP_CACHE(TYPE, RESERVED_SLOTS) \
 	static uint32_t CONCAT(TYPE, _mmap_db_len); \
 	static uint32_t *CONCAT(TYPE, _mmap_next_entry); \
 	static struct CONCAT(TYPE, _entry) *CONCAT(TYPE, _db); \
-	static struct avl_tree CONCAT(TYPE, _avl);
+	static struct avl_tree CONCAT(TYPE, _avl); \
+	static const uint32_t CONCAT(TYPE, _reserved_slots) = (RESERVED_SLOTS);
 
 #define MMAP_CACHE_INIT(TYPE, SIZE, CMP_FN, KEY, FORMAT_KEY_FN) \
 { \
@@ -51,31 +52,42 @@
 		goto CONCAT(TYPE, _init_out); \
 	CONCAT(TYPE, _mmap_next_entry) = mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0); \
 	CONCAT(TYPE, _db) = (struct CONCAT(TYPE, _entry) *)(CONCAT(TYPE, _mmap_next_entry) + 1); \
-	debug_printf(TOSTRING(TYPE)" DEBUG next_entry:0x%ld db:0x%ld\n", (uint64_t)CONCAT(TYPE, _mmap_next_entry), (uint64_t)CONCAT(TYPE, _db)); \
+	debug_printf(TOSTRING(TYPE)" DEBUG next_entry:0x%ld (%d) db:0x%ld\n", (uint64_t)CONCAT(TYPE, _mmap_next_entry), *CONCAT(TYPE, _mmap_next_entry), (uint64_t)CONCAT(TYPE, _db)); \
 	if (CONCAT(TYPE, _db) == NULL) \
 		goto CONCAT(TYPE, _init_out); \
 	for (int i=0; i<SIZE; ++i) { \
 		struct CONCAT(TYPE, _entry) *entry = CONCAT(TYPE, _db)+i; \
 		if (!entry->node.key) { \
 			char *buff = (char *)entry; \
-			if (!*buff && !memcmp(buff, buff+1, sizeof(*entry)-1)) \
+			if (!*buff && !memcmp(buff, buff+1, sizeof(*entry)-1)) { \
+				debug_printf("Reached a full empty entry - assuming end of data.\n"); \
+				if (CONCAT(TYPE, _mmap_db_len) != *CONCAT(TYPE, _mmap_next_entry)) { \
+					error_printf("next pointer clamping.\n"); \
+					*CONCAT(TYPE, _mmap_next_entry) = CONCAT(TYPE, _mmap_db_len); \
+				} \
 				break; \
+			} \
 		} \
 		if (entry->node.key) { \
 			memset(&entry->node, 0, sizeof(entry->node)); \
-			entry->node.key = &entry->KEY; \
-			if (FORMAT_KEY_FN != NULL) debug_printf(TOSTRING(TYPE)"_cache Loading %s from mmap cache\n", ((char * (*)(const void *))FORMAT_KEY_FN)(entry->node.key)); \
-			if (avl_insert(&CONCAT(TYPE, _avl), &entry->node)) { \
-				error_printf("Error inserting "TOSTRING(TYPE)" entry from mmap cache\n"); \
-				entry->node.key = NULL; \
+			/* Skip reserved slots for AVL insertion */ \
+			if (i >= CONCAT(TYPE, _reserved_slots)) { \
+				entry->node.key = &entry->KEY; \
+				if (FORMAT_KEY_FN != NULL) debug_printf(TOSTRING(TYPE)"_cache Loading %s from mmap cache\n", ((char * (*)(const void *))FORMAT_KEY_FN)(entry->node.key)); \
+				if (avl_insert(&CONCAT(TYPE, _avl), &entry->node)) { \
+					error_printf("Error inserting "TOSTRING(TYPE)" entry from mmap cache\n"); \
+					entry->node.key = NULL; \
+				} \
+			} else { \
+				entry->node.key = NULL; /* Reserved slots don't go in AVL */ \
 			} \
 		} else { \
 			debug_printf(TOSTRING(TYPE)"_cache entry %d not used\n", i); \
 		} \
 		CONCAT(TYPE, _mmap_db_len)++; \
 	} \
-	assert((CONCAT(TYPE, _mmap_db_len) == SIZE) || (CONCAT(TYPE, _mmap_db_len) == *CONCAT(TYPE, _mmap_next_entry))); \
 	debug_printf(TOSTRING(TYPE)"_cache loaded %d entries.\n", CONCAT(TYPE, _mmap_db_len)); \
+	assert((CONCAT(TYPE, _mmap_db_len) == SIZE) || (CONCAT(TYPE, _mmap_db_len) == *CONCAT(TYPE, _mmap_next_entry))); \
 CONCAT(TYPE, _init_out): \
 }
 
@@ -91,12 +103,15 @@ CONCAT(TYPE, _init_out): \
 		} \
 		memset(PTR, 0, sizeof(*PTR)); \
 	} \
-	*CONCAT(TYPE, _mmap_next_entry) = (*(CONCAT(TYPE, _mmap_next_entry)) + 1) % SIZE; 
+	*CONCAT(TYPE, _mmap_next_entry) = (*(CONCAT(TYPE, _mmap_next_entry)) + 1); \
+	if (*CONCAT(TYPE, _mmap_next_entry) >= SIZE) \
+		*CONCAT(TYPE, _mmap_next_entry) = CONCAT(TYPE, _reserved_slots); 
 
 #define MMAP_CACHE_INSERT(PTR, TYPE) \
 	if (avl_insert(&CONCAT(TYPE, _avl), &PTR->node)) { \
 		error_printf("Error adding entry to " TOSTRING(TYPE) ".\n"); \
 		PTR->node.key = NULL; \
+		assert(0); \
 	}
 
 #define MMAP_GET_IDX(TYPE, PTR) (PTR - CONCAT(TYPE, _db))
@@ -124,18 +139,26 @@ CONCAT(TYPE, _init_out): \
 		error_printf("Error in gzwrite for " TOSTRING(TYPE) ".\n"); \
 		goto CONCAT(TYPE, _save_error); \
 	} \
-	for (int i=0; i<SIZE; ++i) { \
-		struct CONCAT(TYPE, _entry) *entry = CONCAT(TYPE, _db)+i; \
+	/* Save reserved slots first (always saved, even if node.key is NULL) */ \
+	for (int i = 0; i < CONCAT(TYPE, _reserved_slots) && i < SIZE; ++i) { \
+		struct CONCAT(TYPE, _entry) *entry = CONCAT(TYPE, _db) + i; \
+		if (gzwrite(gz, entry, offsetof(struct CONCAT(TYPE, _entry), node)) != offsetof(struct CONCAT(TYPE, _entry), node)) { \
+			error_printf("Error in gzwrite for " TOSTRING(TYPE) " reserved slot %d.\n", i); \
+			goto CONCAT(TYPE, _save_error); \
+		} \
+	} \
+	/* Save regular slots (only if they have node.key) */ \
+	for (int i = CONCAT(TYPE, _reserved_slots); i < SIZE; ++i) { \
+		struct CONCAT(TYPE, _entry) *entry = CONCAT(TYPE, _db) + i; \
 		if (!entry->node.key) { \
 			char *buff = (char *)entry; \
 			if (!*buff && !memcmp(buff, buff+1, sizeof(*entry)-1)) \
 				break; \
 		} \
-		if (entry->node.key) { \
-			if (gzwrite(gz, entry, offsetof(struct CONCAT(TYPE, _entry), node)) != offsetof(struct CONCAT(TYPE, _entry), node)) { \
-				error_printf("Error in gzwrite for " TOSTRING(TYPE) ".\n"); \
-				goto CONCAT(TYPE, _save_error); \
-			} \
+		/* Save empty entries to maintain pointer integrity and next pointer assert  */ \
+		if (gzwrite(gz, entry, offsetof(struct CONCAT(TYPE, _entry), node)) != offsetof(struct CONCAT(TYPE, _entry), node)) { \
+			error_printf("Error in gzwrite for " TOSTRING(TYPE) ".\n"); \
+			goto CONCAT(TYPE, _save_error); \
 		} \
 	} \
 CONCAT(TYPE, _save_error): \
@@ -162,7 +185,20 @@ CONCAT(TYPE, _save_error): \
 	if (gzread(gz, &gz_mmap_next_entry, sizeof(gz_mmap_next_entry)) != sizeof(gz_mmap_next_entry)) { \
 		error_printf("Error in gzread for " TOSTRING(TYPE) ".\n"); \
 	} else { \
-		for (int i=0; i<SIZE; ++i) { \
+		/* Load reserved slots first (always loaded, even if node.key is NULL) */ \
+		for (int i = 0; i < CONCAT(TYPE, _reserved_slots) && i < SIZE; ++i) { \
+			struct CONCAT(TYPE, _entry) entry = {}; \
+			int res = gzread(gz, &entry, offsetof(struct CONCAT(TYPE, _entry), node)); \
+			if (res == offsetof(struct CONCAT(TYPE, _entry), node)) { \
+				struct CONCAT(TYPE, _entry) *ptr = CONCAT(TYPE, _db) + i; \
+				memcpy(ptr, &entry, offsetof(struct CONCAT(TYPE, _entry), node)); \
+				ptr->node.key = NULL; /* Reserved slots never have a key */ \
+				if (CONCAT(TYPE, _mmap_db_len) <= i) CONCAT(TYPE, _mmap_db_len) = i + 1; \
+				if (*CONCAT(TYPE, _mmap_next_entry) <= i) *CONCAT(TYPE, _mmap_next_entry) = i + 1; \
+			} \
+		} \
+		/* Load regular slots */ \
+		for (int i = CONCAT(TYPE, _reserved_slots); i < SIZE; ++i) { \
 			struct CONCAT(TYPE, _entry) entry = {}; \
 			int res = gzread(gz, &entry, offsetof(struct CONCAT(TYPE, _entry), node)); \
 			if (res == 0) { \
@@ -183,7 +219,7 @@ CONCAT(TYPE, _save_error): \
 		} \
 	} \
 	debug_printf(TOSTRING(TYPE)"_cache loaded %d entries.\n", CONCAT(TYPE, _mmap_db_len)); \
-	if (*CONCAT(TYPE, _mmap_next_entry) == 0) *CONCAT(TYPE, _mmap_next_entry) = gz_mmap_next_entry; \
+	if (*CONCAT(TYPE, _mmap_next_entry) == 0 || *CONCAT(TYPE, _mmap_next_entry) < CONCAT(TYPE, _reserved_slots)) *CONCAT(TYPE, _mmap_next_entry) = (gz_mmap_next_entry < CONCAT(TYPE, _reserved_slots)) ? CONCAT(TYPE, _reserved_slots) : gz_mmap_next_entry; \
 	if (*CONCAT(TYPE, _mmap_next_entry) != gz_mmap_next_entry) error_printf("Warning - "TOSTRING(TYPE)"_cache using a different next_entry pointer from the one in backup - %d:%d\n", *CONCAT(TYPE, _mmap_next_entry),  gz_mmap_next_entry); \
 	err = gzclose(gz); \
 	if (err != Z_OK) { \
@@ -196,8 +232,17 @@ CONCAT(TYPE, _load_error): \
 { \
 	avl_init(&CONCAT(TYPE, _avl), CMP_FN, false, NULL); \
 	memset(CONCAT(TYPE, _db), 0, sizeof(struct CONCAT(TYPE, _entry)) * CONCAT(TYPE, _mmap_db_len)); \
-	*CONCAT(TYPE, _mmap_next_entry) = 0; \
-	CONCAT(TYPE, _mmap_db_len) = 0 ; \
+	*CONCAT(TYPE, _mmap_next_entry) = CONCAT(TYPE, _reserved_slots); \
+	CONCAT(TYPE, _mmap_db_len) = CONCAT(TYPE, _reserved_slots); \
 }
+
+#define MMAP_ZERO_DB_TAIL(DB, FROM, SIZE)                                    \
+    do {                                                                 \
+        if ((FROM) < (SIZE)) {                                           \
+            memset((DB) + (FROM), 0,                                     \
+                   ((SIZE) - (FROM)) * sizeof((DB)[0]));                 \
+        }                                                                \
+    } while (0)
+
 
 #endif

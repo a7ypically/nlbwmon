@@ -37,7 +37,7 @@
 #include "hosts.h"
 
 #define HOSTS_RECORD_CACHE_SIZE 1000
-DEFINE_MMAP_CACHE(hosts_record);
+DEFINE_MMAP_CACHE(hosts_record, 0);
 
 static struct uloop_timeout HostsNewGraceTimer;
 static int HostsNewGracePeriod = 0;

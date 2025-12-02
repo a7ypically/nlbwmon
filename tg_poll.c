@@ -29,14 +29,24 @@
 #include "utils.h"
 #include "tg.h"
 
+#define TG_POLL_TIMEOUT 60
+
 static int MsgOffset;
 static struct https_ctx *tg_poll_https_ctx;
 static int TGPollErrors;
 
 static void send_poll_command(void);
+static void deferred_poll_cb(struct uloop_timeout *tm)
+{
+	debug_printf("deferred_poll_cb\n");
+	send_poll_command();
+}
+
+static struct uloop_timeout poll_tm = {.cb = deferred_poll_cb};
 
 static int tg_poll_on_data_cb(struct ustream *s, int eof) {
 
+	debug_printf("tg_poll_on_data_cb eof:%d\n", eof);
 	if (!eof) return 0;
 
 	char *buf;
@@ -167,19 +177,22 @@ static int tg_poll_on_data_cb(struct ustream *s, int eof) {
 exit_and_poll:
 
 	ustream_consume(s, len);
-	send_poll_command();
 
-	return 0;
+	debug_printf("setting up deferred_poll_cb\n");
+	uloop_timeout_set(&poll_tm, 150);
+
+	return 1;
 
 error_callback:
 	error_printf("Error in TG polling. Can not parse callback id - %s\n", buf);
 	tg_send_msg("Error in TG polling. Can not parse callback id - time for json parser!");
-	return 0;
+	return 1;
 }
 
 static void send_poll_command(void)
 {
 	char url[512];
+	debug_printf("tg_poll send_poll_command\n");
 	snprintf(url, sizeof(url), "/bot%s/getUpdates?timeout=900&offset=%d", tg_get_token(), MsgOffset+1);
 
 	https_send_msg(tg_poll_https_ctx, url, NULL, NULL);
@@ -187,7 +200,7 @@ static void send_poll_command(void)
 
 static void tg_poll_on_https_error(void)
 {
-	error_printf("Error in https!\n");
+	error_printf("tg_poll_on_https_error - Error in https!\n");
 	tg_send_msg("Error in TG polling. Will not receive any new messages until restart.");
 }
 
@@ -197,7 +210,7 @@ static struct https_cbs tg_poll_https_cbs = {
 };
 	
 int init_tg_poll(void) {
-	tg_poll_https_ctx = https_init(&tg_poll_https_cbs, "api.telegram.org", 443, 0);
+	tg_poll_https_ctx = https_init(&tg_poll_https_cbs, "api.telegram.org", 443, TG_POLL_TIMEOUT);
 
 	if (!tg_get_token()) {
 		error_printf("Telegram token is not set. TG will not be used.\n");

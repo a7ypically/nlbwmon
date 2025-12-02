@@ -29,9 +29,10 @@
 
 #define STREAM_STATE_NOT_CONNECTED 0
 #define STREAM_STATE_CONNECTING 1
-#define STREAM_STATE_IDLE 2
-#define STREAM_STATE_IN_PROG 3
-#define STREAM_STATE_RETRY 4
+#define STREAM_STATE_CONNECTED 2
+#define STREAM_STATE_IDLE 3
+#define STREAM_STATE_IN_PROG 4
+#define STREAM_STATE_RETRY 5
 
 #define HTTPS_MAX_RETRIES 5
 
@@ -50,11 +51,13 @@ struct https_ctx {
 	uint8_t timeout;
 	struct uloop_fd fd;
 	struct uloop_timeout retry_tm;
+	struct uloop_timeout close_tm;
 	int num_retries;
 	int max_retries;
 	int retry_delay;
 	struct ustream_fd stream;
 	struct ustream_ssl ssl;
+	int ssl_initialized;
 	void *ustream_ssl_ctx;
 	struct http_ctx_data http_ctx;
 };
@@ -74,14 +77,18 @@ static int process_http(struct http_ctx_data *http_ctx, struct ustream *s, int *
 				break;
 
 			*newline = 0;
-			debug_printf("https - process_http - %s\n", str);
 
 			if (!strncmp(str, "HTTP/", 5)) {
 				int status = atoi(strchr(str, ' ') + 1);
 				debug_printf("Status:%d\n", status);
 				if (status >= 500) {
-					ustream_consume(s, len);
-					error_printf("Error in http: %s\n", str);
+					ustream_consume(s, newline + 1 - str);
+					str = ustream_get_read_buf(s, &len);
+					if (len > 0) {
+						str[len-1] = 0;
+						error_printf("Error in http: %s\n", str);
+						ustream_consume(s, len);
+					}
 					return -1;
 				}
 
@@ -118,19 +125,26 @@ static void connect_client(struct https_ctx *ctx);
 
 static void retry(struct https_ctx *ctx)
 {
-	error_printf("Error in retry - %s\n", ctx->host);
-	https_close(ctx);
-	error_printf("After close\n");
-	ctx->num_retries++;
-	ctx->state = STREAM_STATE_RETRY;
-	if (ctx->num_retries >= ctx->max_retries) {
-		error_printf("Error in http. Out of retries.\n");
-		ctx->cbs->error();
-	} else {
-		error_printf("Error in http. Will retry. %d/%d\n", ctx->num_retries, ctx->max_retries);
-		uloop_timeout_set(&ctx->retry_tm, ctx->retry_delay * 1000);
-	}
+    error_printf("Error in retry - %s\n", ctx->host);
+    
+    // Cancel any pending close timer before calling https_close
+    uloop_timeout_cancel(&ctx->close_tm);
+    
+    https_close(ctx);
+    error_printf("After close\n");
+    ctx->num_retries++;
+    ctx->state = STREAM_STATE_RETRY;
+    
+    if (ctx->num_retries >= ctx->max_retries) {
+        error_printf("Error in http. Out of retries.\n");
+        ctx->cbs->error();
+    } else {
+        error_printf("Error in http. Will retry. %d/%d\n", 
+                     ctx->num_retries, ctx->max_retries);
+        uloop_timeout_set(&ctx->retry_tm, ctx->retry_delay * 1000);
+    }
 }
+
 
 static void retry_client_cb(struct uloop_timeout *tm)
 {
@@ -139,10 +153,13 @@ static void retry_client_cb(struct uloop_timeout *tm)
 	debug_printf("https - retry_client_cb - state:%d\n", ctx->state);
 	// Check the state to determine the next action
 	if (ctx->state == STREAM_STATE_RETRY) {
-		if (ctx->timeout) uloop_timeout_set(&ctx->retry_tm, ctx->timeout * 1000);
+		if (ctx->timeout) {
+			uloop_timeout_set(&ctx->retry_tm, ctx->timeout * 1000);
+			debug_printf("https - timeout reset - %d\n", ctx->timeout * 1000);
+		}
 		connect_client(ctx);
 	} else {
-		error_printf("Error - HTTP timeout occurred, retrying...\n");
+		error_printf("Error (%s) - HTTP timeout occurred, retrying...\n", ctx->host);
 		retry(ctx);
 	}
 }
@@ -152,7 +169,8 @@ static void send_body(struct https_ctx *ctx)
 	assert(ctx->state == STREAM_STATE_IDLE);
 	ctx->state = STREAM_STATE_IN_PROG;
 	memset(&ctx->http_ctx, 0, sizeof(ctx->http_ctx));
-	ustream_write(&ctx->ssl.stream, ctx->req_body, strlen(ctx->req_body), false);
+	int ret = ustream_write(&ctx->ssl.stream, ctx->req_body, strlen(ctx->req_body), false);
+	debug_printf("send_body (%ld) - res:%d\n", strlen(ctx->req_body), ret);
 }
 
 static void client_ssl_notify_read(struct ustream *s, int bytes)
@@ -163,6 +181,7 @@ static void client_ssl_notify_read(struct ustream *s, int bytes)
 	struct https_ctx *ctx = container_of((struct ustream_ssl *)s, struct https_ctx, ssl);
 
 	int res = process_http(&ctx->http_ctx, s, &eof);
+	debug_printf("https(%s) - process_http - %d\n", ctx->host, res);
 
 	if (res < 0) {
 		retry(ctx);
@@ -170,7 +189,10 @@ static void client_ssl_notify_read(struct ustream *s, int bytes)
 	}
 
 	// Reset the HTTP timeout upon receiving data
-	if (ctx->timeout) uloop_timeout_set(&ctx->retry_tm, ctx->timeout * 1000);
+	if (ctx->timeout) {
+		uloop_timeout_set(&ctx->retry_tm, ctx->timeout * 1000);
+		debug_printf("https - timeout reset - %d\n", ctx->timeout * 1000);
+	}
 
 	if (res == 0) return;
 
@@ -181,17 +203,22 @@ static void client_ssl_notify_read(struct ustream *s, int bytes)
 		ctx->state = STREAM_STATE_IDLE;
 	}
 
-	ustream_get_read_buf(s, &size);
-
-	ctx->cbs->data(s, eof);
-
 	// Cancel the HTTP timeout
+	debug_printf("https - Cancel HTTP timeout\n");
 	uloop_timeout_cancel(&ctx->retry_tm);
 
-	if (!eof) {
+	ustream_get_read_buf(s, &size);
+	debug_printf("https(%s) - ustream_get_read_buf - %d bytes\n", ctx->host, size);
+
+	int stop = ctx->cbs->data(s, eof);
+
+	if (!eof && !stop) {
 		ustream_get_read_buf(s, &size_left);
 		ctx->http_ctx.data_consumed += size - size_left;
-		if (ctx->timeout) uloop_timeout_set(&ctx->retry_tm, ctx->timeout * 1000);
+		if (ctx->timeout) {
+			uloop_timeout_set(&ctx->retry_tm, ctx->timeout * 1000);
+			debug_printf("https - timeout reset - %d\n", ctx->timeout * 1000);
+		}
 	}
 }
 
@@ -223,29 +250,48 @@ static void client_notify_verify_error(struct ustream_ssl *ssl, int error, const
 	error_printf("WARNING: SSL certificate error(%d): %s\n", error, str);
 }
 
+/* put this somewhere near the top of https.c */
+static void deferred_close_cb(struct uloop_timeout *tm)
+{
+    struct https_ctx *ctx = container_of(tm, struct https_ctx, close_tm);
+    int cur_state = ctx->state;
+    
+    // Check if already closed
+    if (ctx->state == STREAM_STATE_NOT_CONNECTED && !ctx->ssl_initialized) {
+        debug_printf("deferred_close_cb - already closed, skipping\n");
+        return;
+    }
+    
+    https_close(ctx);
+    
+    if (cur_state == STREAM_STATE_RETRY) return;
+    if (ctx->req_body)  /* reconnect if a request is still pending */
+        connect_client(ctx);
+}
+
 static void client_notify_state(struct ustream *s)
 {
-	if (!s->write_error && !s->eof)
-		return;
-
-	struct https_ctx *ctx = container_of((struct ustream_ssl *)s, struct https_ctx, ssl);
-
-	int cur_state = ctx->state;
-
-	debug_printf("https - Connection closed. state - %d\n", cur_state);
-
-	https_close(ctx);
-
-	if (cur_state == STREAM_STATE_RETRY) return;
-
-	if (ctx->req_body) {
-		connect_client(ctx);
-	}
+    if (!s->write_error && !s->eof)
+        return;
+    
+    struct https_ctx *ctx = container_of((struct ustream_ssl *)s, struct https_ctx, ssl);
+    int cur_state = ctx->state;
+    
+    debug_printf("https - Connection closed. state - %d\n", cur_state);
+    
+    // Cancel any existing close timer before setting a new one
+    uloop_timeout_cancel(&ctx->close_tm);
+    
+    ctx->close_tm.cb = deferred_close_cb;
+    uloop_timeout_set(&ctx->close_tm, 10);
 }
 
 static void connect_ssl(struct https_ctx *ctx)
 {
 	debug_printf("https - Starting SSL negotiation\n");
+
+	// Mark SSL as initialized
+	ctx->ssl_initialized = 1;
 
 	ctx->ssl.notify_error = https_client_notify_error;
 	ctx->ssl.notify_verify_error = client_notify_verify_error;
@@ -266,12 +312,14 @@ static void https_send_connect_cb(struct uloop_fd *f, unsigned int events)
 	struct https_ctx *ctx = container_of(f, struct https_ctx, fd);
 
 	if (f->eof || f->error) {
-		debug_printf("https - Connection failed\n");
-		retry(ctx);
+		debug_printf("https(%s) - Connection failed eof:%d error:%d\n", ctx->host, f->eof, f->error);
+		ctx->state = STREAM_STATE_NOT_CONNECTED;  // Reset state
+		uloop_timeout_set(&ctx->retry_tm, 0);  // Schedule immediate retry
 		return;
 	}
 
-	debug_printf("https - Connection established\n");
+	debug_printf("https(%s) - Connection established\n", ctx->host);
+	ctx->state = STREAM_STATE_CONNECTED;
 	uloop_fd_delete(f);
 	connect_ssl(ctx);
 }
@@ -343,7 +391,10 @@ void https_send_msg(struct https_ctx *ctx, const char *url, const char *data, co
 	ctx->req_body = buf;
 
 	// Set the HTTP timeout
-	if (ctx->timeout) uloop_timeout_set(&ctx->retry_tm, ctx->timeout * 1000);
+	if (ctx->timeout) {
+		uloop_timeout_set(&ctx->retry_tm, ctx->timeout * 1000);
+		debug_printf("https - timeout reset - %d\n", ctx->timeout * 1000);
+	}
 
 	if (ctx->state == STREAM_STATE_IDLE) {
 		send_body(ctx);
@@ -354,14 +405,40 @@ void https_send_msg(struct https_ctx *ctx, const char *url, const char *data, co
 
 void https_close(struct https_ctx *ctx)
 {
-	uloop_timeout_cancel(&ctx->retry_tm);
-	ustream_free(&ctx->ssl.stream);
-	ustream_free(&ctx->stream.stream);
-	if (ctx->stream.fd.fd != -1) {
-		close(ctx->stream.fd.fd);
-		ctx->stream.fd.fd = -1;
-	}
-	ctx->state = STREAM_STATE_NOT_CONNECTED;
+    error_printf("https_close -> fd:%d state:%d ssl_init:%d\n", 
+                 ctx->stream.fd.fd, ctx->state, ctx->ssl_initialized);
+    
+    // Prevent re-entry if already closing
+    if (ctx->state == STREAM_STATE_NOT_CONNECTED && !ctx->ssl_initialized) {
+        error_printf("https_close - already closed, skipping\n");
+        return;
+    }
+    
+    error_printf("https - b4 uloop_timeout_cancel\n");
+    uloop_timeout_cancel(&ctx->retry_tm);
+    uloop_timeout_cancel(&ctx->close_tm);
+    
+    if (ctx->state < STREAM_STATE_CONNECTED) {
+        if (ctx->fd.registered) {
+            error_printf("https - b4 uloop_fd_delete\n");
+            uloop_fd_delete(&ctx->fd);
+            ctx->fd.registered = false;  // Add this line
+        }
+    } else if (ctx->ssl_initialized) {
+        error_printf("https - b4 ustream_free 1\n");
+        ustream_free(&ctx->ssl.stream);
+        error_printf("https - b4 ustream_free 2\n");
+        ustream_free(&ctx->stream.stream);
+        ctx->ssl_initialized = 0;  // Clear flag immediately after freeing
+    }
+    
+    if (ctx->stream.fd.fd != -1) {
+        error_printf("https - b4 close\n");
+        close(ctx->stream.fd.fd);
+        ctx->stream.fd.fd = -1;
+    }
+    
+    ctx->state = STREAM_STATE_NOT_CONNECTED;
 }
 
 char* urlencode(const char* data)

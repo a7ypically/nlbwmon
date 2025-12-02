@@ -49,7 +49,7 @@
 static char *IpInfoToken;
 
 #define GEOIP_MMAP_CACHE_SIZE 10000
-DEFINE_MMAP_CACHE(geoip);
+DEFINE_MMAP_CACHE(geoip, 0);
 
 static struct geoip_entry *ipinfo_cur_entry;
 
@@ -416,5 +416,6 @@ static struct https_cbs geoip_https_cbs = {
 __attribute__((constructor)) static void init_geoip(void)
 {
         geoip_https_ctx = https_init(&geoip_https_cbs, "ipinfo.io", 443, 10);
+	https_set_retries(geoip_https_ctx, 30, 10);
 }
 

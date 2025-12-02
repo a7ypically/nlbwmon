@@ -18,6 +18,7 @@
 
 #include <assert.h>
 #include <endian.h>
+#include <time.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +66,7 @@ void print_record(struct record *r)
 
 	if (!r->country[0]) {
 		country[0] = '0';
-		country[1] = '0' + country[1];
+		country[1] = '0' + r->country[1];
 	} else {
 		country[0] = r->country[0];
 		country[1] = r->country[1];
@@ -85,8 +86,7 @@ database_cmp_index(const void *k1, const void *k2, void *ptr)
 	return memcmp(k1, k2, db_keysize);
 }
 
-
-static void
+void
 database_reindex(struct dbhandle *h)
 {
 	struct record *ptr;
@@ -101,6 +101,7 @@ database_reindex(struct dbhandle *h)
 		print_record(ptr);
 		if (avl_insert(&h->index, &ptr->node)) {
 			error_printf("Error database_reindex - adding record.\n");
+			assert(0);
 		}
 	}
 }
@@ -269,6 +270,7 @@ database_insert(struct dbhandle *h, struct record *rec, struct record **db_rec)
 			print_record(ptr);
 			if (avl_insert(&h->index, &ptr->node)) {
 				error_printf("Error database_insert - Error adding record after recycle.\n");
+				assert(0);
 			}
 
 			if (db_rec) *db_rec = ptr;
@@ -295,6 +297,7 @@ database_insert(struct dbhandle *h, struct record *rec, struct record **db_rec)
 	print_record(ptr);
 	if (avl_insert(&h->index, &ptr->node)) {
 		error_printf("Error - database_insert - Error adding record.\n");
+		assert(0);
 	}
 
 	if (db_rec) *db_rec = ptr;
@@ -306,6 +309,10 @@ database_insert(struct dbhandle *h, struct record *rec, struct record **db_rec)
 void database_update_record(struct record *rec, struct record *ptr)
 {
 	ptr->last_ext_addr = rec->last_ext_addr;
+	assert(rec->last_seen);
+	if (rec->last_seen > ptr->last_seen) {
+		ptr->last_seen = rec->last_seen;
+	}
 	add64(ptr->count, rec->count);
 	add64(ptr->in_pkts, rec->in_pkts);
 	add64(ptr->in_bytes, rec->in_bytes);
@@ -332,13 +339,23 @@ database_update(struct dbhandle *h, struct record *rec, struct record **db_rec)
 	return -ENOENT;
 }
 
-void database_reindex_record(struct record *r)
+void database_index_remove(struct record *r)
 {
+	if (!gdbh)
+		return;
+
 	avl_delete(&gdbh->index, &r->node);
+}
+
+void database_index_add(struct record *r)
+{
+	if (!gdbh)
+		return;
 
 	r->node.key = r;
 	if (avl_insert(&gdbh->index, &r->node)) {
-		error_printf("Error database_reindex_record - Error adding record after delete.\n");
+		error_printf("Error database_index_add - Error adding record.\n");
+		assert(0);
 	}
 }
 
@@ -543,10 +560,12 @@ database_restore_gzip(struct dbhandle *h, const char *path, uint32_t timestamp)
 			database_insert(h, &rec, NULL);
 		}
 
+#if 0
 		if (gzgetc(gz) != -1) {
 			database_gzclose(gz);
 			return -ERANGE;
 		}
+#endif
 	}
 
 	return database_gzclose(gz);
@@ -752,7 +771,7 @@ int database_get_idx(struct record *r, uint32_t *md5)
 	md5_ctx_t ctx;
 	memset(md5, 0, sizeof(*md5) * 4);
 	md5_begin(&ctx);
-	md5_hash(r, db_keysize, &ctx);
+	md5_hash(r, db_md5size, &ctx);
 	md5_end(md5, &ctx);
 
 	return idx;
@@ -769,7 +788,7 @@ struct record *database_get_by_idx(int idx, uint32_t *md5)
 	md5_ctx_t ctx;
 	memset(r_md5, 0, sizeof(*r_md5) * 4);
 	md5_begin(&ctx);
-	md5_hash(r, db_keysize, &ctx);
+	md5_hash(r, db_md5size, &ctx);
 	md5_end(r_md5, &ctx);
 
 	if (memcmp(r_md5, md5, sizeof(r_md5))) {
@@ -796,4 +815,3 @@ struct record *database_find(const void *key, uint32_t size) {
 
 	return ptr;
 }
-

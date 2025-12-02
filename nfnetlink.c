@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <assert.h>
+#include <time.h>
 
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
@@ -43,6 +44,7 @@
 #include "config.h"
 #include "tg.h"
 
+static time_t global_cur_time;
 
 static uint32_t n_pending_inserts = 0;
 static struct nl_sock *nl_event_sock = NULL, *nl_dump_sock = NULL;
@@ -473,6 +475,7 @@ parse_event(void *reply, int len, int type, bool update_mac)
 		reply_pkts = 0;
 		reply_bytes = 0;
 		memset(&r, 0, sizeof(r));
+		r.last_seen = global_cur_time;
 		memset(&orig_saddr, 0, sizeof(orig_saddr));
 		memset(&orig_daddr, 0, sizeof(orig_daddr));
 		memset(&reply_saddr, 0, sizeof(reply_saddr));
@@ -628,6 +631,7 @@ parse_event(void *reply, int len, int type, bool update_mac)
 					add64(dr->in_bytes, r.in_bytes);
 					add64(dr->out_pkts, r.out_pkts);
 					add64(dr->out_bytes, r.out_bytes);
+					dr->last_seen = r.last_seen;
 					if (type == EVENT_TYPE_DELETED) {
 						if (active_entry->flags & ACTIVE_TABLE_FLAG_DELETED) {
 							error_printf("Error - entry was already mark as deleted. OOM event?");
@@ -821,6 +825,7 @@ handle_nl_sock_event(struct uloop_fd *fd, unsigned int ev)
 		error_printf("Can't get time - %s\n", strerror(errno));
 	}
 
+	global_cur_time = time(NULL);
 	debug_printf("handle_event start - %ld.%ld\n", start.tv_sec, start.tv_nsec/1000000);
 	database_archive(gdbh);
 	int len = nl_recvmsgs_default(nl_event_sock);
@@ -1086,6 +1091,7 @@ nfnetlink_dump(bool allow_insert)
 	if (nl_send_auto_complete(nl_dump_sock, req) < 0)
 		goto err;
 
+	global_cur_time = time(NULL);
 	nfnetlink_dump_in_progress = 1;
 	++DumpCounter;
 	if (!DumpCounter) ++DumpCounter;
@@ -1195,4 +1201,3 @@ void nfnetlink_invalidate_active_entries(void)
 		entry->flags &= ~ACTIVE_TABLE_FLAG_DB_PTR_VALID;
 	}
 }
-

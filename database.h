@@ -37,6 +37,10 @@
 #define db_keysize \
 	offsetof(struct record, count)
 
+// topl_index may change when adding rules so we exclude it from md5 sum
+#define db_md5size \
+	offsetof(struct record, topl_domain)
+
 #define db_recsize \
 	offsetof(struct record, node)
 
@@ -61,6 +65,8 @@
 #define RECORD_FLAG_NOTIF_COUNTRY 0x2
 #define RECORD_FLAG_NOTIF_UPLOAD  0x4
 #define RECORD_FLAG_NOTIF_NO_DNS  0x8
+
+
 
 #define RECORD_NUM_HOSTS 4
 
@@ -87,10 +93,19 @@ struct record {
 	uint16_t hosts[RECORD_NUM_HOSTS];
 	struct in6_addr last_ext_addr;
 	uint8_t flags;
+	struct {
+		uint16_t upload : 3;
+		uint16_t incoming : 3;
+		uint16_t outgoing : 3;
+		uint16_t country : 3;
+		uint16_t no_dns : 3;
+		uint16_t reserved : 1;
+	} mute_thresholds;
 	uint64_t out_pkts;
 	uint64_t out_bytes;
 	uint64_t in_pkts;
 	uint64_t in_bytes;
+	time_t last_seen;
 	struct avl_node node;
 };
 
@@ -121,7 +136,9 @@ struct dbhandle * database_init(const struct interval *intv, bool prealloc,
 int database_insert(struct dbhandle *h, struct record *rec, struct record **db_rec);;
 void database_update_record(struct record *rec, struct record *ptr);
 int database_update(struct dbhandle *h, struct record *rec, struct record **db_rec);
-void database_reindex_record(struct record *r);
+void database_index_remove(struct record *r);
+void database_index_add(struct record *r);
+void database_reindex(struct dbhandle *h);
 
 void database_reorder(struct dbhandle *h, avl_tree_comp sort_fn,
                       void *sort_ptr);

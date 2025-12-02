@@ -29,10 +29,16 @@
 #include "protocol.h"
 #include "nfnetlink.h"
 #include "geoip.h"
+#include "dns.h"
 #include "notify.h"
 
 static unsigned char NotifyCountry['Z'-'A' + 1]['Z'-'A' + 1];
-static uint32_t NotifySigUploadKB;
+uint32_t NotifySigUploadKB;
+uint32_t NotifySigUploadMB[4];           /* Index 0 unused, 1-3 for hard-coded MB thresholds */
+uint32_t NotifySigIncomingCounts[4];     /* Index 0 unused, 1-3 for connection thresholds */
+uint32_t NotifySigOutgoingCounts[4];     /* Index 0 unused, 1-3 for connection thresholds */
+static uint64_t NotifySigUploadThreshold;
+static uint64_t NotifySigUploadThresholds[4];  /* Index 0 unused, 1-3 for thresholds */
 static uint32_t NotifySigUploadRatio;
 static uint32_t DnsNoWan;
 static int NotifyNoDNS = 0;
@@ -45,7 +51,7 @@ struct notify_rule_entry {
 };
 
 #define NOTIFY_MMAP_CACHE_SIZE 500
-DEFINE_MMAP_CACHE(notify_rule);
+DEFINE_MMAP_CACHE(notify_rule, 0);
 
 struct notify_delayed_record {
 	struct uloop_timeout timeout;
@@ -142,7 +148,8 @@ struct notify_params **notify_get_all(size_t *count) {
 static int
 avl_cmp_notify_rules(const void *k1, const void *k2, void *ptr)
 {
-	return memcmp(k1, k2, offsetof(struct notify_rule_entry, node));
+	/* Compare only up to topl_domain field, excluding hostname backup field */
+	return memcmp(k1, k2, offsetof(struct notify_params, hostname));
 }
 
 static char *format_notify_rule(const void *ptr)
@@ -161,7 +168,7 @@ static char *format_notify_rule(const void *ptr)
 
 	if (!r->country[0]) {
 		country[0] = '0';
-		country[1] = '0' + country[1];
+		country[1] = '0' + r->country[1];
 	} else {
 		country[0] = r->country[0];
 		country[1] = r->country[1];
@@ -180,6 +187,48 @@ int init_notify(const char *db_path) {
 
 	if (notify_rule_mmap_db_len == 0) {
 		MMAP_CACHE_LOAD(notify_rule, NOTIFY_MMAP_CACHE_SIZE, params, db_path, 0, format_notify_rule);
+	}
+
+	/* Recovery: rebuild TLD indices from backup hostnames and ensure protection */
+	for (int i = 0; i < notify_rule_mmap_db_len; ++i) {
+		struct notify_rule_entry *rule = notify_rule_db + i;
+		if (!rule->node.key) continue;
+		
+		if (rule->params.topl_domain) {
+			uint16_t old_idx = rule->params.topl_domain;
+			uint16_t new_idx = 0;
+			
+			if (rule->params.hostname[0]) {
+				/* Verify the current index points to the correct hostname */
+				const char *current_hostname = dns_get_topl(rule->params.topl_domain);
+				if (!current_hostname || strcmp(current_hostname, rule->params.hostname) != 0) {
+					/* Index is invalid or points to wrong hostname, rebuild from backup */
+					debug_printf("Rebuilding TLD index for rule with hostname '%s'\n", rule->params.hostname);
+					new_idx = dns_promote_topl_hostname(rule->params.hostname);
+					if (new_idx) {
+						rule->params.topl_domain = new_idx;
+						debug_printf("Rebuilt TLD index: %d -> %d\n", old_idx, new_idx);
+					} else {
+						error_printf("Failed to rebuild TLD index for hostname '%s'\n", rule->params.hostname);
+						rule->params.topl_domain = 0;
+					}
+				} else {
+					/* Hostname matches, but ensure it's in protected zone */
+					new_idx = dns_promote_topl_index(rule->params.topl_domain);
+					if (new_idx != old_idx) {
+						rule->params.topl_domain = new_idx;
+						debug_printf("Promoted TLD index to protected zone: %d -> %d\n", old_idx, new_idx);
+					}
+				}
+			} else {
+				/* No backup hostname, but ensure current index is in protected zone */
+				new_idx = dns_promote_topl_index(rule->params.topl_domain);
+				if (new_idx != old_idx) {
+					rule->params.topl_domain = new_idx;
+					debug_printf("Promoted TLD index to protected zone: %d -> %d\n", old_idx, new_idx);
+				}
+			}
+		}
 	}
 
 	const char *list = config_get("notify_country_list");
@@ -202,7 +251,22 @@ int init_notify(const char *db_path) {
 	}
 
 	NotifySigUploadKB = config_get_uint32("notify_outbound_kb", 1024*10);
+	NotifySigUploadMB[1] = config_get_uint32("notify_outbound_mb1", 20);
+	NotifySigUploadMB[2] = config_get_uint32("notify_outbound_mb2", 50);
+	NotifySigUploadMB[3] = config_get_uint32("notify_outbound_mb3", 100);
+	NotifySigIncomingCounts[1] = config_get_uint32("notify_incoming_count1", 10);
+	NotifySigIncomingCounts[2] = config_get_uint32("notify_incoming_count2", 50);
+	NotifySigIncomingCounts[3] = config_get_uint32("notify_incoming_count3", 100);
+	NotifySigOutgoingCounts[1] = config_get_uint32("notify_outgoing_count1", 10);
+	NotifySigOutgoingCounts[2] = config_get_uint32("notify_outgoing_count2", 50);
+	NotifySigOutgoingCounts[3] = config_get_uint32("notify_outgoing_count3", 100);
 	NotifySigUploadRatio = config_get_uint32("notify_outbound_ratio", 50);
+	
+	/* Pre-calculate thresholds to avoid repeated calculations */
+	NotifySigUploadThreshold = (uint64_t)NotifySigUploadKB * 1024;
+	NotifySigUploadThresholds[1] = (uint64_t)NotifySigUploadMB[1] * 1024 * 1024;
+	NotifySigUploadThresholds[2] = (uint64_t)NotifySigUploadMB[2] * 1024 * 1024;
+	NotifySigUploadThresholds[3] = (uint64_t)NotifySigUploadMB[3] * 1024 * 1024;
 	DnsNoWan = config_get_uint32("no_dns_for_wan", 1);
 
 	if (config_get_uint32("notify_no_dns", 0)) {
@@ -252,9 +316,14 @@ int notify_is_muted(struct record *r, uint8_t notif_record_flag, struct notify_p
 		print_record(r);
 #endif
 
-		// Mark as notify so we don't keep running is_muted on this record
-		r->flags |= notif_record_flag;
-		return 1;
+		if (rule->action == NOTIFY_ACTION_MUTE) {
+			// Mark as permanently muted
+			r->flags |= notif_record_flag;
+			return rule->action;
+		} else if (rule->action >= NOTIFY_ACTION_MUTE_THRESHOLD1 && rule->action <= NOTIFY_ACTION_MUTE_THRESHOLD3) {
+			// Return action for conditional muting - caller will set mute_threshold
+			return rule->action;
+		}
 	}
 
 	return 0;
@@ -270,29 +339,136 @@ static inline int notify_is_country(char *country) {
 	return NotifyCountry[idx1][idx2];
 }
 
+/* Utility function to get current threshold for a notification type */
+static uint8_t notify_get_threshold(struct record *rec, uint8_t notif_flag)
+{
+	switch (notif_flag) {
+		case RECORD_FLAG_NOTIF_UPLOAD:   return rec->mute_thresholds.upload;
+		case RECORD_FLAG_NOTIF_INBOUND:  return rec->mute_thresholds.incoming;
+		case RECORD_FLAG_NOTIF_COUNTRY:  return rec->mute_thresholds.outgoing;
+		case RECORD_FLAG_NOTIF_NO_DNS:   return rec->mute_thresholds.no_dns;
+		default: return 0;
+	}
+}
+
+/* Utility function to set threshold for a notification type */
+static void notify_set_threshold(struct record *rec, uint8_t notif_flag, uint8_t threshold)
+{
+	switch (notif_flag) {
+		case RECORD_FLAG_NOTIF_UPLOAD:   rec->mute_thresholds.upload = threshold; break;
+		case RECORD_FLAG_NOTIF_INBOUND:  rec->mute_thresholds.incoming = threshold; break;
+		case RECORD_FLAG_NOTIF_COUNTRY:  rec->mute_thresholds.outgoing = threshold; break;
+		case RECORD_FLAG_NOTIF_NO_DNS:   rec->mute_thresholds.no_dns = threshold; break;
+	}
+}
+
+/* Utility function to check if record has passed upload byte threshold */
+static bool notify_check_upload_threshold(struct record *rec, uint8_t threshold_level)
+{
+	uint64_t out = be64toh(rec->out_bytes);
+	if (out > NotifySigUploadThresholds[threshold_level]) {
+		uint64_t in = be64toh(rec->in_bytes);
+		if (out * (100/NotifySigUploadRatio) > in) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Utility function to check if record has passed connection count threshold */
+static bool notify_check_connection_threshold(struct record *rec, uint8_t notif_flag, uint8_t threshold_level)
+{
+	uint64_t count = be64toh(rec->count);
+	uint32_t *count_thresholds = (notif_flag == RECORD_FLAG_NOTIF_INBOUND) ? 
+		NotifySigIncomingCounts : NotifySigOutgoingCounts;
+	return (count >= count_thresholds[threshold_level]);
+}
+
+static void notify_apply_flags_to_records(struct notify_params *params, uint8_t action)
+{
+	/* Only apply flags for threshold actions - NOTIFY_ACTION_MUTE is handled in notify_update/notify_new */
+	if (action < NOTIFY_ACTION_MUTE_THRESHOLD1 || action > NOTIFY_ACTION_MUTE_THRESHOLD3)
+		return;
+
+	uint8_t threshold_level = action - NOTIFY_ACTION_MUTE_THRESHOLD1 + 1;
+	uint8_t notif_flag = params->notify_flag;
+
+	/* Only check records that have the notification flag set */
+	struct record *rec = NULL;
+	while ((rec = database_next(gdbh, rec)) != NULL) {
+		/* Skip records that don't have the notification flag set */
+		if (!(rec->flags & notif_flag))
+			continue;
+
+		/* Skip records that already have a higher or equal threshold set */
+		uint8_t current_threshold = notify_get_threshold(rec, notif_flag);
+		if (current_threshold >= threshold_level)
+			continue;
+
+		/* Check if record has already passed the threshold */
+		bool skip_modification = false;
+		if (notif_flag == RECORD_FLAG_NOTIF_UPLOAD) {
+			skip_modification = notify_check_upload_threshold(rec, threshold_level);
+		} else if (notif_flag == RECORD_FLAG_NOTIF_INBOUND || notif_flag == RECORD_FLAG_NOTIF_COUNTRY) {
+			skip_modification = notify_check_connection_threshold(rec, notif_flag, threshold_level);
+		}
+		
+		if (skip_modification)
+			continue;
+
+		if (notify_is_match(rec, notif_flag, params)) {
+			/* Convert permanent mute to conditional mute for specific threshold */
+			notify_set_threshold(rec, notif_flag, threshold_level);
+		}
+	}
+}
+
 void notify_new(struct record *r, int duration, uint32_t active_entry_id) {
 	if (r->type & RECORD_TYPE_WAN_IN) {
+		/* Handle incoming notifications - first connection only */
 		if (r->proto == 1) return;
-		if (r->flags & RECORD_FLAG_NOTIF_INBOUND) return;
 
-		if (!notify_is_muted(r, RECORD_FLAG_NOTIF_INBOUND, NULL)) {
-			if (be64toh(r->count) == 1) {
-				if (duration == -1) {
-					if (notify_new_delay(r, active_entry_id) == 0) return;
-				} else if (duration < 15000) {
-					return;
+		if (!(r->flags & RECORD_FLAG_NOTIF_INBOUND)) {
+			int action = notify_is_muted(r, RECORD_FLAG_NOTIF_INBOUND, NULL);
+			if (!action) {
+				/* Check if we should notify on first connection */
+				if (be64toh(r->count) == 1) {
+					if (duration == -1) {
+						if (notify_new_delay(r, active_entry_id) == 0) return;
+					} else if (duration < 15000) {
+						return;
+					}
+				}
+				
+				tg_notify_incoming(r, RECORD_FLAG_NOTIF_INBOUND);
+				r->flags |= RECORD_FLAG_NOTIF_INBOUND;
+			} else if (action >= NOTIFY_ACTION_MUTE_THRESHOLD1 && action <= NOTIFY_ACTION_MUTE_THRESHOLD3) {
+				/* Set incoming threshold for conditional muting */
+				notify_set_threshold(r, RECORD_FLAG_NOTIF_INBOUND, action - NOTIFY_ACTION_MUTE_THRESHOLD1 + 1);
+				r->flags |= RECORD_FLAG_NOTIF_INBOUND;
+			}
+			/* For NOTIFY_ACTION_MUTE, flag was already set in notify_is_muted */
+		}
+		/* Note: Connection threshold checking moved to notify_update() */
+	} else {
+		/* Handle outgoing notifications - first connection only */
+		
+		if (!(r->flags & RECORD_FLAG_NOTIF_COUNTRY) && notify_is_country(r->country)) {
+			if (!(r->flags & RECORD_FLAG_NOTIF_COUNTRY)) {
+				int action = notify_is_muted(r, RECORD_FLAG_NOTIF_COUNTRY, NULL);
+				if (!action) {
+					tg_notify_outgoing(r, RECORD_FLAG_NOTIF_COUNTRY);
+					r->flags |= RECORD_FLAG_NOTIF_COUNTRY;
+				} else if (action >= NOTIFY_ACTION_MUTE_THRESHOLD1 && action <= NOTIFY_ACTION_MUTE_THRESHOLD3) {
+					/* Set outgoing threshold for conditional muting */
+					notify_set_threshold(r, RECORD_FLAG_NOTIF_COUNTRY, action - NOTIFY_ACTION_MUTE_THRESHOLD1 + 1);
+					r->flags |= RECORD_FLAG_NOTIF_COUNTRY;
 				}
 			}
-			tg_notify_incoming(r, RECORD_FLAG_NOTIF_INBOUND);
-			r->flags |= RECORD_FLAG_NOTIF_INBOUND;
+			/* Note: Connection threshold checking moved to notify_update() */
 		}
-	} else {
-		if (!(r->flags & RECORD_FLAG_NOTIF_COUNTRY) && notify_is_country(r->country)) {
-			if (!notify_is_muted(r, RECORD_FLAG_NOTIF_COUNTRY, NULL)) {
-				tg_notify_outgoing(r, RECORD_FLAG_NOTIF_COUNTRY);
-				r->flags |= RECORD_FLAG_NOTIF_COUNTRY;
-			}
-		}
+
+		/* Handle no DNS notifications (no threshold support for now) */
 		if (NotifyNoDNS && !r->topl_domain && !(r->flags & RECORD_FLAG_NOTIF_NO_DNS)) {
 			if (!(r->type & RECORD_TYPE_WAN) || !DnsNoWan) {
 				if ((r->proto != 1) && ((r->proto != 17) || (r->dst_port != DNS_UDP_NET_PORT)) && !geoip_is_bogon(r->country)) {
@@ -307,15 +483,71 @@ void notify_new(struct record *r, int duration, uint32_t active_entry_id) {
 }
 
 void notify_update(struct record *r) {
-	if (!(r->flags & RECORD_FLAG_NOTIF_UPLOAD)) {
+	/* Handle upload notifications */
+	uint8_t upload_threshold = notify_get_threshold(r, RECORD_FLAG_NOTIF_UPLOAD);
+	
+	/* Early exit for permanently muted upload records - most common case */
+	if ((r->flags & RECORD_FLAG_NOTIF_UPLOAD) && (upload_threshold == 0)) {
+		/* Still need to check connection thresholds below */
+	} else if (!(r->flags & RECORD_FLAG_NOTIF_UPLOAD)) {
+		/* Normal threshold check - most common case for new records */
 		uint64_t out = be64toh(r->out_bytes);
-		if (out > NotifySigUploadKB*1024) {
+		
+		if (out > NotifySigUploadThreshold) {
 			uint64_t in = be64toh(r->in_bytes);
 			if (out * (100/NotifySigUploadRatio) > in) {
-				if (!notify_is_muted(r, RECORD_FLAG_NOTIF_UPLOAD, NULL)) {
+				int action = notify_is_muted(r, RECORD_FLAG_NOTIF_UPLOAD, NULL);
+				if (!action) {
 					tg_notify_upload(r, RECORD_FLAG_NOTIF_UPLOAD);
 					r->flags |= RECORD_FLAG_NOTIF_UPLOAD;
+				} else if (action >= NOTIFY_ACTION_MUTE_THRESHOLD1 && action <= NOTIFY_ACTION_MUTE_THRESHOLD3) {
+					/* Set upload threshold for conditional muting */
+					notify_set_threshold(r, RECORD_FLAG_NOTIF_UPLOAD, action - NOTIFY_ACTION_MUTE_THRESHOLD1 + 1);
+					r->flags |= RECORD_FLAG_NOTIF_UPLOAD;
 				}
+				/* For NOTIFY_ACTION_MUTE, flag was already set in notify_is_muted */
+			}
+		}
+	} else if (upload_threshold > 0) {
+		/* Threshold check for records with conditional muting - least common case */
+		if (notify_check_upload_threshold(r, upload_threshold)) {
+			tg_notify_upload(r, RECORD_FLAG_NOTIF_UPLOAD);
+			notify_set_threshold(r, RECORD_FLAG_NOTIF_UPLOAD, 0); /* Clear threshold after notification */
+		}
+	}
+
+	/* Handle incoming connection thresholds */
+	if (r->type & RECORD_TYPE_WAN_IN) {
+		uint8_t incoming_threshold = notify_get_threshold(r, RECORD_FLAG_NOTIF_INBOUND);
+		
+		/* Early exit for permanently muted incoming records */
+		if ((r->flags & RECORD_FLAG_NOTIF_INBOUND) && (incoming_threshold == 0)) {
+			return;
+		}
+
+		if ((r->flags & RECORD_FLAG_NOTIF_INBOUND) && (incoming_threshold > 0)) {
+			/* Threshold check for records with conditional muting */
+			if (notify_check_connection_threshold(r, RECORD_FLAG_NOTIF_INBOUND, incoming_threshold)) {
+				tg_notify_incoming(r, RECORD_FLAG_NOTIF_INBOUND);
+				notify_set_threshold(r, RECORD_FLAG_NOTIF_INBOUND, 0); /* Clear threshold after notification */
+			}
+		}
+	}
+
+	/* Handle outgoing connection thresholds */
+	if (!(r->type & RECORD_TYPE_WAN_IN)) {
+		uint8_t outgoing_threshold = notify_get_threshold(r, RECORD_FLAG_NOTIF_COUNTRY);
+		
+		/* Early exit for permanently muted outgoing records */
+		if ((r->flags & RECORD_FLAG_NOTIF_COUNTRY) && (outgoing_threshold == 0)) {
+			return;
+		}
+
+		if ((r->flags & RECORD_FLAG_NOTIF_COUNTRY) && (outgoing_threshold > 0)) {
+			/* Threshold check for records with conditional muting */
+			if (notify_check_connection_threshold(r, RECORD_FLAG_NOTIF_COUNTRY, outgoing_threshold)) {
+				tg_notify_outgoing(r, RECORD_FLAG_NOTIF_COUNTRY);
+				notify_set_threshold(r, RECORD_FLAG_NOTIF_COUNTRY, 0); /* Clear threshold after notification */
 			}
 		}
 	}
@@ -325,14 +557,39 @@ void notify_new_client(struct ether_addr *mac) {
 	tg_notify_new_client(mac);
 }
 
-int notify_mute_add(struct notify_params *params) {
+int notify_mute_add(struct notify_params *params, uint8_t action) {
 	struct notify_rule_entry *ptr, key = {};
 	key.params = *params;
-	key.action = NOTIFY_ACTION_MUTE;
+	key.action = action;
 
 	ptr = avl_find_element(&notify_rule_avl, &key, ptr, node);
 
-	if (ptr) return -EEXIST;
+	if (ptr) {
+		if (ptr->action == action) {
+			return -EEXIST;
+		} else {
+			ptr->action = action;
+			/* Apply threshold flags to existing records that match this rule */
+			notify_apply_flags_to_records(&key.params, key.action);
+			return 0;
+		}
+	}
+
+	/* Promote the TLD index into protected range if needed */
+	if (key.params.topl_domain) {
+		key.params.topl_domain = params->topl_domain = dns_promote_topl_index(key.params.topl_domain);
+		
+		/* Copy hostname for backup/recovery purposes */
+		const char *hostname = dns_get_topl(key.params.topl_domain);
+		if (hostname) {
+			strncpy(key.params.hostname, hostname, MAX_TOPL_DNS_LEN);
+			key.params.hostname[MAX_TOPL_DNS_LEN] = '\0';
+		} else {
+			key.params.hostname[0] = '\0';
+		}
+	} else {
+		key.params.hostname[0] = '\0';
+	}
 
 	MMAP_CACHE_GET_NEXT(ptr, notify_rule, NOTIFY_MMAP_CACHE_SIZE, NULL);
 	ptr->params = key.params;
@@ -340,6 +597,9 @@ int notify_mute_add(struct notify_params *params) {
 	ptr->node.key = &ptr->params;
 	MMAP_CACHE_INSERT(ptr, notify_rule);
 	MMAP_CACHE_SAVE(notify_rule, NOTIFY_MMAP_CACHE_SIZE, NULL, 0);
+
+	/* Apply threshold flags to existing records that match this rule */
+	notify_apply_flags_to_records(&key.params, key.action);
 
 	return 0;
 }

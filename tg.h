@@ -37,5 +37,6 @@ void tg_on_poll_text(int chat_id, int message_id, char *text);
 void tg_on_poll_pinned(int chat_id, int message_id);
 int init_tg_poll(void);
 int init_tg(const char *db_path);
+void tg_dns_topl_remap(const uint16_t *remap, uint32_t len);
 
 #endif

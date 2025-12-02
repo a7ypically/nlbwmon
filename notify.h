@@ -1,4 +1,3 @@
-
 /*
   ISC License
 
@@ -21,8 +20,12 @@
 #include <netinet/in.h>
 #include <netinet/ether.h>
 #include "database.h"
+#include "dns.h"
 
 #define NOTIFY_ACTION_MUTE 1
+#define NOTIFY_ACTION_MUTE_THRESHOLD1 2
+#define NOTIFY_ACTION_MUTE_THRESHOLD2 3
+#define NOTIFY_ACTION_MUTE_THRESHOLD3 4
 
 struct notify_params {
 	uint8_t proto;
@@ -37,14 +40,21 @@ struct notify_params {
 	char country[2];
 	uint16_t asn;
 	uint16_t topl_domain;
+	char hostname[MAX_TOPL_DNS_LEN + 1];  /* backup hostname for recovery */
 };
 
 int init_notify(const char *db_path);
 void notify_new(struct record *r, int duration, uint32_t active_entry_id);
 void notify_update(struct record *r);
 void notify_new_client(struct ether_addr *mac);
-int notify_mute_add(struct notify_params *params);
+int notify_mute_add(struct notify_params *params, uint8_t action);
 int notify_is_muted(struct record *r, uint8_t notif_record_flag, struct notify_params *params);
 struct notify_params **notify_get_all(size_t *count);
+
+/* Global configuration variables */
+extern uint32_t NotifySigUploadKB;
+extern uint32_t NotifySigUploadMB[4];           /* Index 0 unused, 1-3 for hard-coded MB thresholds */
+extern uint32_t NotifySigIncomingCounts[4];     /* Index 0 unused, 1-3 for connection thresholds */
+extern uint32_t NotifySigOutgoingCounts[4];     /* Index 0 unused, 1-3 for connection thresholds */
 
 #endif

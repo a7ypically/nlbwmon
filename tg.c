@@ -116,7 +116,33 @@ static struct tg_msg_entry *TGCurrentMsg;
 static int TGNextMsgIDToSend = -1;
 
 #define TG_MMAP_CACHE_SIZE 500
-DEFINE_MMAP_CACHE(tg_msg);
+DEFINE_MMAP_CACHE(tg_msg, 0);
+
+void tg_dns_topl_remap(const uint16_t *remap, uint32_t len)
+{
+	if (!remap || !len)
+		return;
+
+	for (int i = 0; i < tg_msg_mmap_db_len; ++i) {
+		struct tg_msg_entry *msg = tg_msg_db + i;
+		/* Unused slots: message_id == -1 or node.key == NULL */
+		if ((msg->message_id == -1) || !msg->node.key)
+			continue;
+
+		uint16_t old = msg->rec_key.topl_domain;
+		if (!old) continue;
+		if (old >= len) {
+			//Log error: TLD domain index is out of range
+			error_printf("tg_dns_topl_remap: TLD domain index is out of range: %u\n", old);
+			continue;
+		}
+
+		uint16_t newidx = remap[old];
+		/* If TLD was purged, newidx will be 0, which we treat as "no TLD" */
+		if (newidx != old)
+			msg->rec_key.topl_domain = newidx;
+	}
+}
 
 static int RefreshMsgQueue[TG_MMAP_CACHE_SIZE];
 static int RefreshMsgQueueHead = 0;
@@ -165,6 +191,31 @@ static void tg_add_inline_key(int *itr, const char *name, const char *param)
 	++(*itr);
 }
 
+/* Utility function to format threshold selection keys */
+static void tg_format_threshold_keys(int *keys, uint32_t *values, const char *unit)
+{
+	char limit_str[32];
+	
+	snprintf(limit_str, sizeof(limit_str), "below %u%s", values[1], unit);
+	tg_add_inline_key(keys, limit_str, "1");
+	
+	snprintf(limit_str, sizeof(limit_str), "below %u%s", values[2], unit);
+	tg_add_inline_key(keys, limit_str, "2");
+	tg_add_inline_key(keys, "\n", "");
+	
+	snprintf(limit_str, sizeof(limit_str), "below %u%s", values[3], unit);
+	tg_add_inline_key(keys, limit_str, "3");
+}
+
+/* Utility function to format threshold description */
+static void tg_format_threshold_desc(char *buf, size_t size, uint32_t *values, const char *unit, int threshold_level)
+{
+	if (threshold_level == 0) {
+		strcpy(buf, "always");
+	} else {
+		snprintf(buf, size, "below %u%s threshold", values[threshold_level], unit);
+	}
+}
 
 static void tg_api_reply_callback(void)
 {
@@ -371,7 +422,7 @@ static void tg_format_inline_keys(struct tg_msg_entry *msg, char *msg_str, int m
 			return;
 		}
 
-		len += snprintf(msg_str, msg_size, "%s %s.</b>",
+		len = snprintf(msg_str, msg_size, "%s %s",
 				msg->rec_key.type & RECORD_TYPE_WAN_IN ? "to" : "from",
 				TGCallbackState[4] == 1 ? client_name_str: "any client");
 				
@@ -379,7 +430,60 @@ static void tg_format_inline_keys(struct tg_msg_entry *msg, char *msg_str, int m
 		msg_str += len;
 		assert(msg_size > 0);
 
+		/* Add threshold selection for all notification types */
 		if (TGCallbackState[5] == 0) {
+			/* Skip threshold state for no_dns notifications - they don't support thresholds */
+			if (msg->notify_flag == RECORD_FLAG_NOTIF_NO_DNS) {
+				TGCallbackState[5] = 9; /* Always mute */
+				/* Jump directly to confirm state */
+				len = snprintf(msg_str, msg_size, " always.</b>");
+				msg_size -= len;
+				msg_str += len;
+				assert(msg_size > 0);
+				
+				tg_add_inline_key(&keys, "Confirm", "1");
+				tg_add_inline_key(&keys, "Cancel", "cancel");
+				return;
+			}
+			
+			tg_add_inline_key(&keys, "Always", "9");
+			tg_add_inline_key(&keys, "\n", "");
+			
+			if (msg->notify_flag == RECORD_FLAG_NOTIF_UPLOAD) {
+				tg_format_threshold_keys(&keys, NotifySigUploadMB, "MB");
+				snprintf(msg_str, msg_size, " with upload limit...</b>");
+			} else if (msg->notify_flag == RECORD_FLAG_NOTIF_INBOUND) {
+				tg_format_threshold_keys(&keys, NotifySigIncomingCounts, " conn");
+				snprintf(msg_str, msg_size, " with connection limit...</b>");
+			} else if (msg->notify_flag == RECORD_FLAG_NOTIF_COUNTRY) {
+				tg_format_threshold_keys(&keys, NotifySigOutgoingCounts, " conn");
+				snprintf(msg_str, msg_size, " with connection limit...</b>");
+			}
+			
+			tg_add_inline_key(&keys, "\n", "");
+			tg_add_inline_key(&keys, "Cancel", "cancel");
+			return;
+		}
+		
+		char desc_buf[32] = "always";
+
+		if (TGCallbackState[5] != 9) {
+			/* Display selected threshold 	*/
+			if (msg->notify_flag == RECORD_FLAG_NOTIF_UPLOAD) {
+				tg_format_threshold_desc(desc_buf, sizeof(desc_buf), NotifySigUploadMB, "MB", TGCallbackState[5]);
+			} else if (msg->notify_flag == RECORD_FLAG_NOTIF_INBOUND) {
+				tg_format_threshold_desc(desc_buf, sizeof(desc_buf), NotifySigIncomingCounts, " connections", TGCallbackState[5]);
+			} else if (msg->notify_flag == RECORD_FLAG_NOTIF_COUNTRY) {
+				tg_format_threshold_desc(desc_buf, sizeof(desc_buf), NotifySigOutgoingCounts, " connections", TGCallbackState[5]);
+			}
+		}
+		
+		len = snprintf(msg_str, msg_size, " %s.</b>", desc_buf);
+		msg_size -= len;
+		msg_str += len;
+		assert(msg_size > 0);
+
+		if (TGCallbackState[6] == 0) {
 			tg_add_inline_key(&keys, "Confirm", "1");
 			tg_add_inline_key(&keys, "Cancel", "cancel");
 			return;
@@ -414,7 +518,31 @@ static void tg_format_inline_keys(struct tg_msg_entry *msg, char *msg_str, int m
 
 static int tg_check_muted(struct record *r, uint8_t notify_flag, char *msg, int *len, int size)
 {
-	if (notify_is_muted(r, notify_flag, NULL)) {
+	int action = notify_is_muted(r, notify_flag, NULL);
+	if (action >= NOTIFY_ACTION_MUTE_THRESHOLD1 && action <= NOTIFY_ACTION_MUTE_THRESHOLD3) {
+		int threshold_level = action - NOTIFY_ACTION_MUTE_THRESHOLD1 + 1;
+		char threshold_desc[64];
+		
+		/* Get appropriate threshold array and unit based on notification type */
+		switch (notify_flag) {
+			case RECORD_FLAG_NOTIF_UPLOAD:
+				tg_format_threshold_desc(threshold_desc, sizeof(threshold_desc), NotifySigUploadMB, "MB", threshold_level);
+				break;
+			case RECORD_FLAG_NOTIF_INBOUND:
+				tg_format_threshold_desc(threshold_desc, sizeof(threshold_desc), NotifySigIncomingCounts, " connections", threshold_level);
+				break;
+			case RECORD_FLAG_NOTIF_COUNTRY:
+				tg_format_threshold_desc(threshold_desc, sizeof(threshold_desc), NotifySigOutgoingCounts, " connections", threshold_level);
+				break;
+			default:
+				/* Fallback for unsupported threshold types */
+				snprintf(threshold_desc, sizeof(threshold_desc), "threshold %d", threshold_level);
+				break;
+		}
+		
+		*len += snprintf(msg, size, "%c%c%c%c <b>MUTED %s</b>\n",0xf0, 0X9f, 0x94, 0x95, threshold_desc);
+		return 1;
+	} else if (action == NOTIFY_ACTION_MUTE) {
 		*len += snprintf(msg, size, "%c%c%c%c <b>MUTED</b>\n",0xf0, 0X9f, 0x94, 0x95);
 		return 1;
 	}
@@ -437,6 +565,7 @@ static const char *tg_get_country_str(const char *country)
 static void tg_get_host_names(struct record *r, char *str, int size) {
 
 	int count;
+	const char *domain;
 
 	assert(size > 0);
 	for (count=0; count<RECORD_NUM_HOSTS; ++count) if (!r->hosts[count]) break;
@@ -445,15 +574,21 @@ static void tg_get_host_names(struct record *r, char *str, int size) {
 		str[0] = 0;
 		return;
 	} else if (count == 1) {
-		snprintf(str, size, "Host: <b>%s</b>\n", dns_get_by_id(r->hosts[0]));
+		domain = dns_get_by_id(r->hosts[0]);
+		if (!domain) domain = dns_get_topl(r->topl_domain);
+		snprintf(str, size, "Host: <b>%s</b>\n", domain);
 		return;
 	}
 
 	int len = snprintf(str, size, "Remote hosts:\n");
 
+	count = 0;
+
 	for (int i=0; i<RECORD_NUM_HOSTS; ++i) {
 		if (!r->hosts[i]) break;
-		const char *domain = dns_get_by_id(r->hosts[i]);
+		domain = dns_get_by_id(r->hosts[i]);
+		if (!domain) break;
+		++count;
 		len += snprintf(str + len, size - len, "- %s\n", domain);
 		if (len >= size) {
 			str[size-4] = '.';
@@ -461,6 +596,12 @@ static void tg_get_host_names(struct record *r, char *str, int size) {
 			str[size-2] = '\n';
 			break;
 		}
+	}
+
+	// If we override old hosts records we may have to use topl
+	if (count == 0) {
+		domain = dns_get_topl(r->topl_domain);
+		snprintf(str, size, "Host: <b>%s</b>\n", domain);
 	}
 }
 
@@ -808,6 +949,10 @@ static int tg_send_on_data_cb(struct ustream *s, int eof)
 	debug_printf("%s\n", buf);
 	if (!strstr(buf, "\"ok\":true")) {
 		error_printf("TG send msg - Error:%s\n", buf);
+		if (strstr(buf, "\"error_code\":400")) {
+			error_printf("msg not found, skip it\n");
+			goto exit_on_error_skip;
+		}
 		goto exit_on_error;
 	}
 
@@ -848,8 +993,9 @@ exit_ok:
 	return 0;
 
 exit_on_error:
-	ustream_consume(s, len);
 	tg_send_errors++;
+exit_on_error_skip:
+	ustream_consume(s, len);
 	if (tg_send_errors > 3) {
 		error_printf("Error - Too many errors in sending TG msgs. Stopping until service restart.\n");
 		return 0;
@@ -1041,7 +1187,10 @@ static void tg_handle_state_callback(struct tg_msg_entry *msg, char *callback_da
 	int state = atoi(callback_data);
 	
 	if (TGCallbackState[0] == 1) {
-		for (int i=1; i<5; ++i) {
+		/* All notification types now support 6 states: org/host, country, protocol, client, threshold, confirm */
+		int max_states = 6;
+		
+		for (int i=1; i<max_states; ++i) {
 			if (!TGCallbackState[i]) {
 				TGCallbackState[i] = state;
 				tg_msg_refresh(msg->message_id);
@@ -1051,7 +1200,7 @@ static void tg_handle_state_callback(struct tg_msg_entry *msg, char *callback_da
 		}
 
 		int valid = 0;
-		for (int i=1; i<5; ++i) {
+		for (int i=1; i<max_states; ++i) {
 			if (TGCallbackState[i] != 9) {
 				valid = 1;
 				break;
@@ -1062,6 +1211,7 @@ static void tg_handle_state_callback(struct tg_msg_entry *msg, char *callback_da
 			CallbackQueryID = strdup(callback_query_id);
 			CallbackMsgReply = "Rule must contain at least one specified condition";
 			tg_send_next_msg();
+			return;
 		}
 
 		struct notify_params params = {};
@@ -1088,12 +1238,37 @@ static void tg_handle_state_callback(struct tg_msg_entry *msg, char *callback_da
 
 		if (msg->rec_key.type & RECORD_TYPE_WAN_IN) params.type |= RECORD_TYPE_WAN_IN;
 
-		int err = notify_mute_add(&params);
+		/* Determine action based on threshold selection for all notification types */
+		uint8_t action = NOTIFY_ACTION_MUTE;
+		if (TGCallbackState[5] > 0 && TGCallbackState[5] < 9) {
+			action = NOTIFY_ACTION_MUTE_THRESHOLD1 + TGCallbackState[5] - 1; /* Convert 1,2,3 to threshold actions */
+		}
+
+		/* Store original domain before notify_mute_add in case of swap */
+		uint16_t original_topl_domain = msg->rec_key.topl_domain;
+		
+		int err = notify_mute_add(&params, action);
 		CallbackQueryID = strdup(callback_query_id);
 		if (err == -EEXIST) {
 			CallbackMsgReply = "Identical rule already exists";
 		} else {
 			CallbackMsgReply = "Rule added successfully";
+			
+			/* Handle potential domain swaps from hostname backup recovery */
+			if (params.topl_domain && (params.topl_domain != original_topl_domain)) {
+				/* Domain swap detected - update all TG messages that reference either domain */
+				for (int i = 0; i < tg_msg_mmap_db_len; ++i) {
+					struct tg_msg_entry *m = tg_msg_db + i;
+					if (m->message_id == -1) continue;
+					
+					/* Swap domains: original_topl_domain <-> params.topl_domain */
+					if (m->rec_key.topl_domain == original_topl_domain) {
+						m->rec_key.topl_domain = params.topl_domain;
+					} else if (m->rec_key.topl_domain == params.topl_domain) {
+						m->rec_key.topl_domain = original_topl_domain;
+					}
+				}
+			}
 		}
 		tg_send_next_msg();
 		TGCallbackStateMsgID = -1;
@@ -1215,10 +1390,12 @@ void tg_on_poll_callback(int chat_id, int message_id, char *callback_query_id, c
 
 	if (!strncmp(callback_data, "Refresh", 7) || !strcmp(callback_data, "cancel")) {
 		if (r || (msg->type == TG_MSG_ID_TYPE_CLIENT_INFO)) {
-			if (r && !strncmp(callback_data, "Refresh", 7)) {
-				msg->ext_addr = r->last_ext_addr;
+			if (!strncmp(callback_data, "Refresh", 7)) {
+				RefreshNum = atoi(callback_data + 7) + 1;
+				if (r) {
+					msg->ext_addr = r->last_ext_addr;
+				}
 			}
-			RefreshNum = atoi(callback_data + 7) + 1;
 			tg_msg_refresh(message_id);
 			tg_send_next_msg();
 			return;
@@ -1432,7 +1609,7 @@ static void send_notify_rules(const char *filter_client) {
         const char *proto_str = "";
         if (r->proto) {
             if (r->dst_port) {
-                proto_str = get_protocol_name(r->proto, r->dst_port);
+                proto_str = get_protocol_name(r->proto, ntohs(r->dst_port));
             } else {
                 proto_str = get_protocol_name(r->proto, 0);
                 if (strstr(proto_str, " ")) proto_str = "All UDP/TCP";  // Cleanup if "proto 0"

@@ -35,7 +35,7 @@
 #include "asn.h"
 
 #define ASNS_MMAP_CACHE_SIZE 10000
-DEFINE_MMAP_CACHE(asn);
+DEFINE_MMAP_CACHE(asn, 0);
 
 int asn_add(uint32_t asn, const char *org)
 {

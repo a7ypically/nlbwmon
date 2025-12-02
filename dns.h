@@ -31,11 +31,29 @@ struct dns_record_entry {
 	struct avl_node node;
 };
 
+/*
+ * dns_topl_record_entry
+ *
+ * Index 0 is a special meta-slot which is NOT inserted into the AVL tree.
+ * In that slot, the `meta.last_rules_index` field stores the highest
+ * rule-protected TLD index.  All other slots use `name.hostname`.
+ */
 struct dns_topl_record_entry {
 	uint32_t id;
-	char hostname[MAX_TOPL_DNS_LEN+1];
+	union {
+		char hostname[MAX_TOPL_DNS_LEN + 1]; /* regular slot */
+		uint32_t last_rules_index;            /* meta at slot 0 */
+	};
 	struct avl_node node;
 };
+
+/* Convenience macros */
+#define DNS_TOPL_META_SLOT          0
+#define DNS_TOPL_LAST_RULES_IDX()   (dns_topl_record_db[DNS_TOPL_META_SLOT].last_rules_index)
+#define DNS_TOPL_SET_LAST_RULES_IDX(v) (dns_topl_record_db[DNS_TOPL_META_SLOT].last_rules_index = (v))
+#define DNS_TOPL_HOSTNAME(rec)      ((rec)->hostname)
+
+
 
 union dns_ip_cache_key {
 	uint32_t u32[9];
@@ -66,5 +84,10 @@ uint16_t dns_inc_count_for_addr(uint8_t family, void *addr, void *c_addr, uint16
 const char *dns_get_by_id(uint32_t id);
 int init_dns(const char *db_path, uint32_t timestamp);
 const char *dns_get_topl(uint16_t topl_mmap_idx);
+
+/* --- new TLD management helpers --- */
+uint16_t dns_promote_topl_index(uint16_t idx);
+uint16_t dns_promote_topl_hostname(const char *hostname);
+void dns_compact_topl_db(void);
 
 #endif

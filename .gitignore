@@ -7,7 +7,6 @@ netlink/*
 lib*.a
 lib*.so*
 *.gz
-*.sh
 a.out
 as.csv
 cacert.pem

@@ -368,7 +368,7 @@ static bool notify_check_upload_threshold(struct record *rec, uint8_t threshold_
 	uint64_t out = be64toh(rec->out_bytes);
 	if (out > NotifySigUploadThresholds[threshold_level]) {
 		uint64_t in = be64toh(rec->in_bytes);
-		if (out * (100/NotifySigUploadRatio) > in) {
+		if (out * 100 > in * NotifySigUploadRatio) {
 			return true;
 		}
 	}
